@@ -1,4 +1,31 @@
 {
+  "voice": {
+    "loading": "Connecting…",
+    "listening": "Listening",
+    "sendHint": "Pause 1s pastes and sends",
+    "speech": "Hearing speech…",
+    "committing": "Sending…",
+    "stopping": "Stopping…",
+    "copy": "Copy draft",
+    "dismiss": "Close voice mode",
+    "copied": "Copied",
+    "copyFailed": "Could not copy",
+    "errors": {
+      "target_changed": "Return to the selected window, or copy the draft.",
+      "target_unavailable": "The selected window is unavailable. You can copy the draft.",
+      "unsupported_desktop": "Voice mode needs a KDE Wayland desktop with a floating panel.",
+      "backlog": "Recognition could not keep up. Voice mode stopped; check the draft.",
+      "model": "Recognition stopped unexpectedly. Turn voice mode off and try again.",
+      "out_of_memory": "Not enough memory for recognition. Try a smaller model.",
+      "unsupported_model": "This model does not support the requested live recognition. Check the model and language.",
+      "microphone": "The microphone stopped. Check its connection and enable voice mode again.",
+      "timeout": "Recognition took too long. Voice mode stopped; check the draft.",
+      "desktop": "Could not insert text. Return to the selected window, or copy the draft.",
+      "busy": "The previous recording is still finishing. Try again shortly.",
+      "cancelled": "Insertion was cancelled. You can copy the draft.",
+      "delivery_uncertain": "Text may already be inserted or sent. Check the window; your draft is saved."
+    }
+  },
   "tray": {
     "settings": "Settings...",
     "checkUpdates": "Check for Updates...",

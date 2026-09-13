@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { listen } from "@tauri-apps/api/event";
 import RecordingOverlay from "./RecordingOverlay";
+import VoiceOverlay, { useVoiceSession } from "./VoiceOverlay";
 import {
   applyTheme,
   getStoredTheme,
@@ -18,8 +19,20 @@ applyTheme(getStoredTheme());
 syncThemeFromSettings();
 listen<Theme>("theme-changed", (event) => applyTheme(event.payload));
 
+function Overlay() {
+  const voice = useVoiceSession();
+  return (
+    <>
+      <div hidden={!!voice && voice.status !== "off"}>
+        <RecordingOverlay />
+      </div>
+      <VoiceOverlay snapshot={voice} />
+    </>
+  );
+}
+
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <RecordingOverlay />
+    <Overlay />
   </React.StrictMode>,
 );

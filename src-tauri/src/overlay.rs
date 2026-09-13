@@ -78,6 +78,8 @@ const OVERLAY_BOTTOM_OFFSET: f64 = 40.0;
 /// mapped, so changing position does not require a manual hide/show cycle.
 #[cfg(target_os = "linux")]
 fn configure_layer_shell_position(gtk_window: &gtk::ApplicationWindow, position: OverlayPosition) {
+    gtk_window.set_anchor(Edge::Left, false);
+    gtk_window.set_anchor(Edge::Right, false);
     let (edge, opposite_edge, margin) = match position {
         OverlayPosition::Top => (Edge::Top, Edge::Bottom, OVERLAY_TOP_OFFSET),
         OverlayPosition::Bottom => (Edge::Bottom, Edge::Top, OVERLAY_BOTTOM_OFFSET),
@@ -501,6 +503,9 @@ fn show_overlay_state(app_handle: &AppHandle, state: &str) {
 }
 
 fn show_overlay_state_on_main(app_handle: &AppHandle, state: &str) {
+    if VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     // Size the overlay for this state (compact vs. streaming), then position it.
     let (width, height) = overlay_dimensions(state);
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
@@ -628,6 +633,9 @@ pub fn update_overlay_position(app_handle: &AppHandle) {
 }
 
 fn update_overlay_position_on_main(app_handle: &AppHandle) {
+    if VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
         #[cfg(target_os = "linux")]
         if LAYER_SHELL_ACTIVE.load(Ordering::SeqCst) {
@@ -668,6 +676,9 @@ fn update_overlay_position_on_main(app_handle: &AppHandle) {
 
 /// Hides the recording overlay window with fade-out animation
 pub fn hide_recording_overlay(app_handle: &AppHandle) {
+    if VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire) {
+        return;
+    }
     // Always hide the overlay regardless of settings - if setting was changed while recording,
     // we still want to hide it properly
     if let Some(overlay_window) = app_handle.get_webview_window("recording_overlay") {
@@ -675,9 +686,14 @@ pub fn hide_recording_overlay(app_handle: &AppHandle) {
         let _ = overlay_window.emit("hide-overlay", ());
         // Hide the window after a short delay to allow animation to complete
         let window_clone = overlay_window.clone();
+        let app = app_handle.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            let _ = window_clone.hide();
+            let _ = app.run_on_main_thread(move || {
+                if !VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire) {
+                    let _ = window_clone.hide();
+                }
+            });
         });
     }
 }
@@ -687,6 +703,96 @@ pub fn hide_recording_overlay(app_handle: &AppHandle) {
 // Defaults to false so the audio path doesn't emit until lib.rs::setup
 // populates the cache from initial settings.
 static OVERLAY_ENABLED: AtomicBool = AtomicBool::new(false);
+static VOICE_OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
+static VOICE_LEVELS_QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn voice_overlay_active() -> bool {
+    VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire)
+}
+
+/// The mandatory voice panel has no focusable fallback and ignores the classic
+/// overlay preference. KWin output geometry selects the target's monitor.
+pub fn show_voice_overlay(
+    app: &AppHandle,
+    target: &crate::voice_session::state::Target,
+) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let app_handle = app.clone();
+        let target = target.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        app.run_on_main_thread(move || {
+            use gtk::prelude::*;
+            let result = (|| -> Result<(), String> {
+                if !LAYER_SHELL_ACTIVE.load(Ordering::Acquire) {
+                    return Err("unsupported_desktop".into());
+                }
+                let window = app_handle
+                    .get_webview_window("recording_overlay")
+                    .ok_or("desktop")?;
+                let gtk_window = window.gtk_window().map_err(|_| "desktop")?;
+                let display = gtk::gdk::Display::default().ok_or("desktop")?;
+                let monitor = (0..display.n_monitors())
+                    .filter_map(|i| display.monitor(i))
+                    .find(|monitor| {
+                        let geometry = monitor.geometry();
+                        geometry.x() == target.output_x && geometry.y() == target.output_y
+                    })
+                    .ok_or("target_unavailable")?;
+                gtk_window.set_monitor(&monitor);
+                gtk_window.set_keyboard_mode(KeyboardMode::None);
+                gtk_window.set_anchor(Edge::Top, false);
+                gtk_window.set_anchor(Edge::Left, false);
+                gtk_window.set_anchor(Edge::Bottom, true);
+                gtk_window.set_anchor(Edge::Right, true);
+                gtk_window.set_layer_shell_margin(Edge::Bottom, 24);
+                gtk_window.set_layer_shell_margin(Edge::Right, 24);
+                gtk_window.set_layer_shell_margin(Edge::Top, 0);
+                gtk_window.set_size_request(380, 42);
+                gtk_window.resize(1, 1);
+                VOICE_OVERLAY_ACTIVE.store(true, Ordering::Release);
+                window.show().map_err(|_| "desktop".to_string())
+            })();
+            let _ = tx.send(result);
+        })
+        .map_err(|_| "desktop")?;
+        rx.recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|_| "desktop".to_string())?
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (app, target);
+        Err("unsupported_desktop".into())
+    }
+}
+
+pub fn resize_voice_overlay(app: &AppHandle, height: f64) {
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if !VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire) || !height.is_finite() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(window) = app_handle.get_webview_window("recording_overlay") {
+            use gtk::prelude::*;
+            if let Ok(window) = window.gtk_window() {
+                window.set_size_request(380, height.ceil().clamp(42.0, 140.0) as i32);
+                window.resize(1, 1);
+            }
+        }
+    });
+}
+
+pub fn hide_voice_overlay(app: &AppHandle) {
+    let app_handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        VOICE_OVERLAY_ACTIVE.store(false, Ordering::Release);
+        VOICE_LEVELS_QUIET.store(false, Ordering::Relaxed);
+        if let Some(window) = app_handle.get_webview_window("recording_overlay") {
+            let _ = window.hide();
+        }
+    });
+}
 
 /// Tracks whether gtk-layer-shell was successfully initialized (Linux only).
 /// Used to skip layer-shell calls when the window is a regular fallback.
@@ -700,8 +806,18 @@ pub fn update_overlay_enabled_cache(enabled: bool) {
     OVERLAY_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+fn levels_due(voice: bool, elapsed_ms: u64, quiet: bool, was_quiet: bool) -> bool {
+    let interval = if voice { 100 } else { EMIT_THROTTLE_MS };
+    elapsed_ms >= interval && !(voice && quiet && was_quiet)
+}
+
+fn levels_enabled(classic: bool, voice: bool) -> bool {
+    classic || voice
+}
+
 pub fn emit_levels(app_handle: &AppHandle, levels: &[f32]) {
-    // Skip emission when the overlay is disabled. The recording_overlay
+    let voice = voice_overlay_active();
+    // Skip emission when neither overlay is enabled. The recording_overlay
     // window is created at boot regardless of overlay_style, so without this
     // guard a hidden overlay's WebKit subprocess still
     // processes every event. Each event drives some kind of WebKit
@@ -709,11 +825,13 @@ pub fn emit_levels(app_handle: &AppHandle, levels: &[f32]) {
     // directly characterized; see issue #1279 for the investigation).
     // For users with `overlay_style: none` (the Linux default) this skip
     // eliminates the upstream driver of that accumulation.
-    if !OVERLAY_ENABLED.load(Ordering::Relaxed) {
+    if !levels_enabled(OVERLAY_ENABLED.load(Ordering::Relaxed), voice) {
         return;
     }
 
-    // Throttle to ~30 FPS. Even with the overlay enabled, the raw audio
+    // Voice uses 10 FPS and one zero packet per quiet transition; classic keeps
+    // ~30 FPS. Steady nonzero levels still refresh the voice UI's stale timeout.
+    // Even with the overlay enabled, the raw audio
     // callback fires far faster than the UI needs; capping emission rate
     // cuts the per-frame `eval_script`/IPC volume that drives the wry
     // memory growth in issue #1279 (upstream tauri-apps/wry#1489).
@@ -722,10 +840,17 @@ pub fn emit_levels(app_handle: &AppHandle, levels: &[f32]) {
         .unwrap_or_default()
         .as_millis() as u64;
     let last = LAST_MIC_LEVEL_EMIT.load(Ordering::Relaxed);
-    if now.saturating_sub(last) < EMIT_THROTTLE_MS {
+    let quiet = levels.iter().all(|level| *level == 0.0);
+    if !levels_due(
+        voice,
+        now.saturating_sub(last),
+        quiet,
+        VOICE_LEVELS_QUIET.load(Ordering::Relaxed),
+    ) {
         return;
     }
     LAST_MIC_LEVEL_EMIT.store(now, Ordering::Relaxed);
+    VOICE_LEVELS_QUIET.store(voice && quiet, Ordering::Relaxed);
 
     // Target only the overlay window. In Tauri 2 both `AppHandle::emit`
     // and `WebviewWindow::emit` broadcast to all webviews; Tauri's
@@ -742,6 +867,21 @@ pub fn emit_levels(app_handle: &AppHandle, levels: &[f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_levels_ignore_classic_none_and_bound_quiet_and_steady_emission() {
+        assert!(levels_enabled(false, true));
+        assert!(levels_enabled(true, false));
+        assert!(!levels_enabled(false, false));
+        assert!(!levels_due(true, 99, false, false));
+        assert!(levels_due(true, 100, false, false));
+        assert!(levels_due(true, 100, true, false));
+        assert!(!levels_due(true, 1000, true, true));
+        assert!(levels_due(true, 100, false, true));
+        assert!(!levels_due(false, 32, false, false));
+        assert!(levels_due(false, 33, false, false));
+        assert!(levels_due(false, 33, true, true));
+    }
 
     #[test]
     fn monitor_hit_test_uses_half_open_physical_bounds() {

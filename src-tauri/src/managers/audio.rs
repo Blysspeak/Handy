@@ -313,11 +313,12 @@ fn create_audio_recorder(
             }
         })
         .with_audio_callback({
-            let router = stream_router;
+            let router = Arc::clone(&stream_router);
             move |frame| {
                 router.feed(frame);
             }
-        });
+        })
+        .with_voice_activity_callback(move |speech| stream_router.voice_activity(speech));
 
     Ok(recorder)
 }
@@ -332,6 +333,9 @@ pub struct RecordingReadiness {
 }
 
 impl RecordingReadiness {
+    pub fn wait_timeout(self, timeout: Duration) -> bool {
+        self.receiver.recv_timeout(timeout).is_ok()
+    }
     pub fn wait(self) -> bool {
         self.receiver.recv().is_ok()
     }
@@ -797,6 +801,44 @@ impl AudioRecordingManager {
         binding_id: &str,
         vad_policy: VadPolicy,
     ) -> Result<RecordingReadiness, String> {
+        if self.stream_router.voice_busy() || crate::overlay::voice_overlay_active() {
+            return Err("Persistent voice mode owns the microphone".to_string());
+        }
+        self.start_recording_with_retention(binding_id, vad_policy, true)
+    }
+
+    /// Persistent voice forwards raw-timed frames and retains no recording.
+    pub fn start_voice_recording(&self) -> Result<RecordingReadiness, String> {
+        self.start_recording_with_retention("voice_mode", VadPolicy::Disabled, false)
+    }
+
+    pub fn voice_boundary(&self, boundary: Box<dyn FnOnce() + Send>) -> Result<(), String> {
+        let recorder = self.recorder.lock().map_err(|_| "Recorder lock failed")?;
+        recorder
+            .as_ref()
+            .ok_or("Recorder is not available")?
+            .voice_boundary(boundary)
+    }
+
+    pub fn voice_capture_healthy(&self) -> bool {
+        self.is_recording()
+            && self
+                .recorder
+                .lock()
+                .map(|recorder| {
+                    recorder
+                        .as_ref()
+                        .is_some_and(|recorder| !recorder.needs_reopen())
+                })
+                .unwrap_or(false)
+    }
+
+    fn start_recording_with_retention(
+        &self,
+        binding_id: &str,
+        vad_policy: VadPolicy,
+        retain_samples: bool,
+    ) -> Result<RecordingReadiness, String> {
         let mut state = self.state.lock().unwrap();
 
         if let RecordingState::Idle = *state {
@@ -815,7 +857,7 @@ impl AudioRecordingManager {
             }
 
             if let Some(rec) = self.recorder.lock().unwrap().as_ref() {
-                match rec.start(vad_policy) {
+                match rec.start_with_retention(vad_policy, retain_samples) {
                     Ok(receiver) => {
                         let generation = self.capture_generation.fetch_add(1, Ordering::AcqRel) + 1;
                         *self.is_recording.lock().unwrap() = true;

@@ -24,6 +24,7 @@ mod transcription_coordinator;
 mod tray;
 mod tray_i18n;
 mod utils;
+mod voice_session;
 
 pub use cli::CliArgs;
 #[cfg(debug_assertions)]
@@ -46,6 +47,50 @@ use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_log::{Builder as LogBuilder, RotationStrategy, Target, TargetKind};
 
 use crate::settings::get_settings;
+use voice_session::VoiceSessionManager;
+
+#[tauri::command]
+fn voice_session_snapshot(
+    manager: tauri::State<'_, Arc<VoiceSessionManager>>,
+) -> Option<voice_session::state::Snapshot> {
+    manager.snapshot()
+}
+
+#[tauri::command]
+fn voice_overlay_height(
+    app: AppHandle,
+    manager: tauri::State<'_, Arc<VoiceSessionManager>>,
+    generation: u64,
+    height: f64,
+) {
+    if manager.snapshot().is_some_and(|s| {
+        s.generation == generation && s.status != voice_session::state::Status::Off
+    }) {
+        overlay::resize_voice_overlay(&app, height);
+    }
+}
+
+#[tauri::command]
+async fn voice_copy_draft(
+    manager: tauri::State<'_, Arc<VoiceSessionManager>>,
+    generation: u64,
+    phrase: u64,
+) -> Result<(), String> {
+    let manager = Arc::clone(manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.copy_draft(generation, phrase))
+        .await
+        .map_err(|_| "desktop".to_string())?
+}
+
+#[tauri::command]
+fn voice_dismiss(manager: tauri::State<'_, Arc<VoiceSessionManager>>, generation: u64) {
+    if manager
+        .snapshot()
+        .is_some_and(|s| s.generation == generation)
+    {
+        manager.dismiss();
+    }
+}
 
 // Global atomic to store the file log level filter
 // We use u8 to store the log::LevelFilter as a number
@@ -180,6 +225,11 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(model_manager.clone());
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
+    app_handle.manage(VoiceSessionManager::new(
+        app_handle.clone(),
+        recording_manager,
+        transcription_manager,
+    ));
     app_handle.manage(tray::TrayState::new());
 
     // Note: Shortcuts are NOT initialized here.
@@ -588,6 +638,12 @@ fn run_headless_transcription(app: &AppHandle, args: &CliArgs) -> i32 {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run(cli_args: CliArgs) {
+    // The newer NVIDIA cooperative-matrix compiler path corrupts teardown on
+    // the tested driver. Scope this mitigation to Handy; honor explicit overrides.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("GGML_VK_DISABLE_COOPMAT2").is_none() {
+        std::env::set_var("GGML_VK_DISABLE_COOPMAT2", "1");
+    }
     // Avoid ggml-metal residency-set teardown assertions when a native engine
     // outlives the Tauri shutdown sequence (#1902). This must happen before
     // transcribe-cpp initializes its Metal device. Advanced users can restore
@@ -744,6 +800,12 @@ pub fn run(cli_args: CliArgs) {
         .expect("Failed to export typescript bindings");
 
     let invoke_handler = specta_builder.invoke_handler();
+    let voice_invoke_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
+        voice_session_snapshot,
+        voice_overlay_height,
+        voice_copy_draft,
+        voice_dismiss
+    ];
 
     // The headless path must run as its own instance (see the single-instance
     // note below), not forward to an already-running app.
@@ -814,11 +876,18 @@ pub fn run(cli_args: CliArgs) {
     // instance instead.
     if !headless_mode {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if args.iter().any(|a| a == "--toggle-transcription") {
+            if args.iter().any(|a| a == "--toggle-voice-mode") {
+                if let Some(manager) = app.try_state::<Arc<VoiceSessionManager>>() {
+                    manager.toggle();
+                }
+            } else if args.iter().any(|a| a == "--toggle-transcription") {
                 signal_handle::send_transcription_input(app, "transcribe", "CLI");
             } else if args.iter().any(|a| a == "--toggle-post-process") {
                 signal_handle::send_transcription_input(app, "transcribe_with_post_process", "CLI");
             } else if args.iter().any(|a| a == "--cancel") {
+                if let Some(manager) = app.try_state::<Arc<VoiceSessionManager>>() {
+                    manager.stop();
+                }
                 crate::utils::cancel_current_operation(app);
             } else {
                 // A second process was launched without remote-control flags
@@ -938,6 +1007,9 @@ pub fn run(cli_args: CliArgs) {
             app.manage(TranscriptionCoordinator::new(app_handle.clone()));
 
             initialize_core_logic(&app_handle);
+            app_handle
+                .state::<Arc<VoiceSessionManager>>()
+                .initialize(cli_args.toggle_voice_mode);
 
             // Secure Input monitor (macOS): detects stuck secure input that
             // silently blocks keyed shortcuts, warns the user, and activates
@@ -969,7 +1041,8 @@ pub fn run(cli_args: CliArgs) {
             // Show main window only if not starting hidden.
             // CLI --start-hidden flag overrides the setting.
             // But if permission onboarding is required, always show the window.
-            let should_hide = settings.start_hidden || cli_args.start_hidden;
+            let should_hide =
+                settings.start_hidden || cli_args.start_hidden || cli_args.toggle_voice_mode;
             let should_force_show = should_force_show_permissions_window(&app_handle);
 
             // If start_hidden but tray is disabled, we must show the window
@@ -1010,7 +1083,13 @@ pub fn run(cli_args: CliArgs) {
             }
             _ => {}
         })
-        .invoke_handler(invoke_handler)
+        .invoke_handler(move |invoke| match invoke.message.command() {
+            "voice_session_snapshot"
+            | "voice_overlay_height"
+            | "voice_copy_draft"
+            | "voice_dismiss" => voice_invoke_handler(invoke),
+            _ => invoke_handler(invoke),
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match &event {
@@ -1033,6 +1112,9 @@ pub fn run(cli_args: CliArgs) {
             }
             // Teardown transcribe.cpp before exit
             tauri::RunEvent::Exit => {
+                if let Some(manager) = app.try_state::<Arc<VoiceSessionManager>>() {
+                    manager.shutdown();
+                }
                 if let Some(tm) = app.try_state::<Arc<TranscriptionManager>>() {
                     let _ = tm.unload_model();
                 }
