@@ -11,6 +11,12 @@ import unicodedata
 
 KEYS = {"toggle": 335544388}
 ACCEL = "org.kde.KGlobalAccel"
+TMUX_BUFFER = "handy-voice"
+# Claude Code collapses a long paste into "[Pasted text #N ...]" (screen_key form).
+PASTED_MARKER = "[Pastedtext"
+POLL = .05
+PASTE_CONFIRM = 1.
+SUBMIT_CONFIRM = 1.5
 
 
 class BridgeError(Exception):
@@ -84,6 +90,125 @@ def paste_keys(app_id):
     return ["42:1", "110:1", "110:0", "42:0"]
 
 
+def log(message):
+    print(f"voice delivery: {message}", file=sys.stderr, flush=True)
+
+
+def screen_key(text):
+    """Text without whitespace or box drawing: TUI wrapping and borders drop out."""
+    return "".join(c for c in text if not c.isspace() and not "─" <= c <= "╿")
+
+
+def needles(text):
+    key = screen_key(text)
+    return ([key[-24:]] if key else []) + [PASTED_MARKER]
+
+
+def depth(screen, needle):
+    """Fewest bottom content rows of a pane capture that contain needle, or None."""
+    joined = ""
+    for count, row in enumerate(reversed(screen.rstrip().split("\n")), 1):
+        joined = screen_key(row) + joined
+        if needle in joined:
+            return count
+    return None
+
+
+def shown(before, after, candidates):
+    """The first needle that is new, or lower, in the pane after a paste."""
+    if after is None or after == before:
+        return None
+    for needle in candidates:
+        now = depth(after, needle)
+        if now is not None:
+            was = depth(before, needle)
+            if was is None or now < was:
+                return needle
+    return None
+
+
+def descends(pid, ancestor):
+    """True when pid runs below ancestor (a tmux client inside the Ghostty window)."""
+    for _ in range(64):
+        if pid == ancestor:
+            return True
+        if pid <= 1:
+            return False
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            return False
+    return False
+
+
+class TmuxRoute:
+    """Pty delivery into the tmux pane of the one focused client inside the
+    target Ghostty; remembers the pane and needle of the generation's last paste."""
+    def __init__(self, pump):
+        self.pump = pump
+        self.last = None
+
+    def run(self, deadline, *args, data=None, capture=False):
+        out = run_command(["tmux", *args], deadline, self.pump, data, capture=capture)
+        return out.decode(errors="replace") if capture else None
+
+    def resolve(self, target, deadline):
+        """(pane, None) or (None, reason to fall back to ydotool)."""
+        if "ghostty" not in str(target.get("app_id", "")).lower():
+            return None, "not_ghostty"
+        if shutil.which("tmux") is None:
+            return None, "no_tmux"
+        try:
+            listing = self.run(deadline, "list-clients", "-F", "#{client_flags}\t#{pane_id}\t#{client_pid}",
+                               capture=True)
+        except (OSError, subprocess.CalledProcessError):
+            return None, "no_tmux_server"
+        focused = []
+        for line in listing.splitlines():
+            flags, pane, pid = (line.split("\t") + ["", ""])[:3]
+            if "focused" in flags.split(","):
+                focused.append((pane, pid))
+        if len(focused) != 1:
+            return None, f"focused_clients:{len(focused)}"
+        pane, pid = focused[0]
+        # A focused client in another terminal (ssh, phone) must not get the text.
+        if not pane.startswith("%") or not pid.isdigit() or not descends(int(pid), int(target["pid"])):
+            return None, "client_outside_target"
+        return pane, None
+
+    def capture(self, pane, deadline):
+        return self.run(deadline, "capture-pane", "-p", "-t", pane, capture=True)
+
+    def remembered(self, generation):
+        return self.last if self.last and self.last["generation"] == generation else None
+
+    def watch(self, pane, deadline, bound, done, live):
+        """Poll the pane until done(screen), Off or the bound. Observation only:
+        input is already delivered, so this never raises."""
+        start = time.monotonic()
+        screen = None
+        try:
+            end = start + min(bound, deadline.end - deadline.reserve - start - .1)
+            while True:
+                screen = self.capture(pane, deadline)
+                if done(screen):
+                    return screen, time.monotonic() - start, True
+                if not live() or time.monotonic() + POLL > end:
+                    break
+                until = time.monotonic() + POLL
+                while time.monotonic() < until:
+                    self.pump(deadline)
+                    time.sleep(.005)
+        except Exception as error:
+            log(f"watch stopped pane={pane}: {error!r}")
+        return screen, time.monotonic() - start, False
+
+
+def bottom(screen, limit=300):
+    rows = [row.rstrip() for row in (screen or "").rstrip().split("\n") if row.strip()]
+    return "\n".join(rows)[-limit:]
+
+
 def copy(text, deadline, pump=None):
     data = sanitize(text).encode()
     p = pump or (lambda _d: None)
@@ -91,10 +216,10 @@ def copy(text, deadline, pump=None):
     run_command(["wl-copy", "--primary", "--type", "text/plain;charset=utf-8"], deadline, p, data)
 
 
-def guarded_paste(request, current, target_now, copy, send, gate, pump, deadline=None):
+def guarded_paste(request, current, target_now, copy, send, gate, pump, deadline=None, route=None):
     text = sanitize(request["text"])
     if not text.strip():
-        return
+        return None
     if gate.busy:
         raise BridgeError("busy")
     # Set BEFORE any nested GLib dispatch in focus queries, subprocesses or waits.
@@ -102,10 +227,12 @@ def guarded_paste(request, current, target_now, copy, send, gate, pump, deadline
     deadline = deadline or Deadline()
     injected = False
     error = None
+    result = None
+    generation = request["generation"]
 
     def live():
         deadline.remaining()
-        if not current(request["generation"]):
+        if not current(generation):
             raise BridgeError("cancelled")
 
     def check():
@@ -115,19 +242,48 @@ def guarded_paste(request, current, target_now, copy, send, gate, pump, deadline
         live()
 
     try:
-        check()  # A mismatch here MUST NOT touch the clipboard.
-        copy(text, deadline)
-        check()
-        injected = True  # Even a failed subprocess may have emitted some input.
-        send(paste_keys(request["target"]["app_id"]), deadline)
-        # No Enter here: Rust submits the whole batch after 3 s of silence.
-        # The gap only lets the app read this clipboard before the next copy.
-        until = time.monotonic() + .08
-        while time.monotonic() < until:
+        check()  # A mismatch here MUST NOT touch the clipboard or a tmux pane.
+        pane, reason = route.resolve(request["target"], deadline) if route else (None, None)
+        if pane is not None:
+            check()
+            if route.resolve(request["target"], deadline)[0] != pane:
+                raise BridgeError("target_changed")
+            before = route.capture(pane, deadline)
+            route.run(deadline, "load-buffer", "-b", TMUX_BUFFER, "-", data=text.encode())
             live()
-            pump(deadline)
-            time.sleep(min(.002, deadline.remaining()))
-        live()
+            injected = True
+            route.run(deadline, "paste-buffer", "-p", "-d", "-b", TMUX_BUFFER, "-t", pane)
+            # No Enter here either. Submit is allowed only once the text is seen.
+            candidates = needles(text)
+            screen, elapsed, confirmed = route.watch(
+                pane, deadline, PASTE_CONFIRM,
+                lambda screen: shown(before, screen, candidates) is not None,
+                lambda: current(generation))
+            route.last = {"generation": generation, "pane": pane, "candidates": candidates,
+                          "needle": shown(before, screen, candidates)}
+            visible_ms = round(elapsed * 1000)
+            log(f"op=paste path=tmux pane={pane} confirmed={confirmed} visible_ms={visible_ms}")
+            if not confirmed:
+                log(f"paste unconfirmed pane={pane} bottom={json.dumps(bottom(screen), ensure_ascii=False)}")
+            result = {"path": "tmux", "pane": pane, "confirmed": confirmed, "visible_ms": visible_ms}
+        else:
+            if route is not None:
+                log(f"op=paste path=ydotool reason={reason}")
+            copy(text, deadline)
+            check()
+            injected = True  # Even a failed subprocess may have emitted some input.
+            send(paste_keys(request["target"]["app_id"]), deadline)
+            # No Enter here: Rust submits the whole batch after 3 s of silence.
+            # The gap only lets the app read this clipboard before the next copy.
+            until = time.monotonic() + .08
+            while time.monotonic() < until:
+                live()
+                pump(deadline)
+                time.sleep(min(.002, deadline.remaining()))
+            live()
+            if route is not None:
+                route.last = {"generation": generation, "pane": None}
+            result = {"path": "ydotool"}
     except Exception as failure:
         error = failure
     finally:
@@ -136,20 +292,23 @@ def guarded_paste(request, current, target_now, copy, send, gate, pump, deadline
         if injected:
             raise BridgeError("delivery_uncertain") from error
         raise error
+    return result
 
 
-def guarded_submit(request, current, target_now, send, gate, deadline=None):
-    """One Enter for already pasted text, only into the window that got it."""
+def guarded_submit(request, current, target_now, send, gate, deadline=None, route=None):
+    """One Enter for already pasted text, only into the window (and tmux pane) that got it."""
     if gate.busy:
         raise BridgeError("busy")
     gate.busy = True
     deadline = deadline or Deadline()
     injected = False
     error = None
+    result = None
+    generation = request["generation"]
 
     def live():
         deadline.remaining()
-        if not current(request["generation"]):
+        if not current(generation):
             raise BridgeError("cancelled")
 
     try:
@@ -157,8 +316,50 @@ def guarded_submit(request, current, target_now, send, gate, deadline=None):
         if not same_target(request["target"], target_now(deadline)):
             raise BridgeError("target_changed")
         live()
-        injected = True
-        send(["28:1", "28:0"], deadline)
+        last = route.remembered(generation) if route else None
+        pane = last["pane"] if last else None
+        if pane is not None:
+            focused, reason = route.resolve(request["target"], deadline)
+            live()
+            if focused != pane:
+                log(f"op=submit path=tmux pane={focused} expected={pane} reason={reason} result=target_changed")
+                raise BridgeError("target_changed")
+            before = route.capture(pane, deadline)
+            candidates = [last["needle"]] if last["needle"] else last["candidates"]
+            needle = next((n for n in candidates if depth(before, n) is not None), None)
+            if needle is None:
+                # Enter into a TUI still digesting the paste can be swallowed.
+                log(f"op=submit path=tmux pane={pane} result=paste_unconfirmed "
+                    f"bottom={json.dumps(bottom(before), ensure_ascii=False)}")
+                raise BridgeError("paste_unconfirmed")
+            rows = depth(before, needle)
+            live()
+            injected = True
+            route.run(deadline, "send-keys", "-t", pane, "Enter")
+
+            def cleared(screen):
+                # Sent: the text left the input line, i.e. it is gone or now sits
+                # at least two rows higher (above the prompt row and its border).
+                # An Enter turned into a newline moves it up by only one row.
+                now = depth(screen, needle)
+                return screen != before and (now is None or now >= rows + 2)
+
+            # Observe only. A second Enter could send an empty or duplicate message.
+            screen, elapsed, confirmed = route.watch(pane, deadline, SUBMIT_CONFIRM, cleared,
+                                                     lambda: current(generation))
+            cleared_ms = round(elapsed * 1000)
+            if confirmed:
+                log(f"op=submit path=tmux pane={pane} confirmed=True cleared_ms={cleared_ms}")
+            else:
+                log(f"submit unconfirmed pane={pane} after_ms={cleared_ms} "
+                    f"bottom={json.dumps(bottom(screen), ensure_ascii=False)}")
+            result = {"path": "tmux", "pane": pane, "confirmed": confirmed, "cleared_ms": cleared_ms}
+        else:
+            if route is not None:
+                log(f"op=submit path=ydotool reason={'last_paste_ydotool' if last else 'no_paste_record'}")
+            injected = True
+            send(["28:1", "28:0"], deadline)
+            result = {"path": "ydotool"}
     except Exception as failure:
         error = failure
     finally:
@@ -167,9 +368,11 @@ def guarded_submit(request, current, target_now, send, gate, deadline=None):
         if injected:
             raise BridgeError("delivery_uncertain") from error
         raise error
+    return result
 
 
-def run_command(argv, deadline, pump, data=None, duration=None):
+def run_command(argv, deadline, pump, data=None, duration=None, capture=False):
+    """Returns stdout bytes when capture is set (its stderr is then discarded)."""
     deadline.remaining()
     until = time.monotonic() + duration if duration is not None else deadline.end
     previous_step = deadline.step_end
@@ -177,16 +380,17 @@ def run_command(argv, deadline, pump, data=None, duration=None):
     process = None
     try:
         process = subprocess.Popen(argv, stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
-                                   stdout=subprocess.DEVNULL)
+                                   stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL if capture else None)
         while True:
             try:
                 left = min(deadline.remaining(), until - time.monotonic())
                 if left <= 0:
                     raise BridgeError("timeout")
-                process.communicate(input=data, timeout=min(.02, left))
+                output = process.communicate(input=data, timeout=min(.02, left))
                 if process.returncode:
                     raise subprocess.CalledProcessError(process.returncode, argv)
-                return
+                return output[0] if capture else None
             except subprocess.TimeoutExpired:
                 data = None
                 pump(deadline)
@@ -330,6 +534,8 @@ def main(directory, parent):
             deadline.remaining()
             context.iteration(False)
 
+    route = TmuxRoute(pump)
+
     def target_now(deadline):
         nonce = focus_reports.begin()
         try:
@@ -397,20 +603,19 @@ def main(directory, parent):
                 raise BridgeError("busy")
             transaction_deadline = Deadline()
             try:
-                guarded_paste(request, current, target_now, copy_text, send, gate,
-                              pump, transaction_deadline)
+                return guarded_paste(request, current, target_now, copy_text, send, gate,
+                                     pump, transaction_deadline, route)
             finally:
                 transaction_deadline = None
-            return None
         if op == "submit":
             if gate.busy:
                 raise BridgeError("busy")
             transaction_deadline = Deadline()
             try:
-                guarded_submit(request, current, target_now, send, gate, transaction_deadline)
+                return guarded_submit(request, current, target_now, send, gate,
+                                      transaction_deadline, route)
             finally:
                 transaction_deadline = None
-            return None
         if op == "copy":
             if gate.busy:
                 raise BridgeError("busy")

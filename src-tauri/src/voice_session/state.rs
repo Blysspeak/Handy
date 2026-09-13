@@ -11,6 +11,8 @@ const SEND_SILENCE_SAMPLES: usize = 16_000 / 4;
 /// Fragments with fewer letters/digits are VAD noise ("Б"), never pasted.
 const MIN_PHRASE_CHARS: usize = 3;
 const MAX_COMMANDS: usize = 1024;
+/// Speech on/off log lines per captured phrase; flicker must not flood the log.
+const MAX_ACTIVITY_LINES: usize = 20;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
@@ -90,6 +92,21 @@ struct Pending {
     pasting: bool,
     speech: bool,
     preview: (String, String),
+    /// Captured audio in this phrase, for the final/dropped log line.
+    samples: usize,
+    committed_at: Instant,
+}
+
+/// Field diagnostics for the phrase being captured; cleared at its commit.
+#[derive(Default)]
+struct Activity {
+    last_edge: Option<Instant>,
+    last_speech_off: Option<Instant>,
+    /// Speech onsets that discarded counted silence.
+    resets: usize,
+    lines: usize,
+    /// Last speech-off to boundary reservation.
+    off_to_reserve: Option<Duration>,
 }
 
 struct Inner {
@@ -112,6 +129,7 @@ struct Inner {
     batch: Option<Target>,
     /// Captured non-speech samples since the last paste or speech frame.
     send_silence_samples: usize,
+    activity: Activity,
 }
 
 pub struct VoiceQueue {
@@ -205,6 +223,7 @@ impl VoiceQueue {
                 pending: VecDeque::new(),
                 batch: None,
                 send_silence_samples: 0,
+                activity: Activity::default(),
             }),
             wake: Condvar::new(),
         }
@@ -268,15 +287,11 @@ impl VoiceQueue {
             return;
         }
         let previous = Self::timers(&s);
-        if speech && !s.snapshot.speech_active {
-            if let (_, Some(remaining)) = previous {
+        if speech != s.snapshot.speech_active {
+            if let (true, (_, Some(remaining))) = (speech, previous) {
                 log::info!("Voice send cancelled by speech {remaining} ms before Enter");
-            } else if s.silence_samples >= SILENCE_SAMPLES / 2 {
-                log::info!(
-                    "Voice silence countdown reset by speech after {} ms",
-                    ms(s.silence_samples)
-                );
             }
+            Self::log_speech_edge(&mut s, speech);
         }
         s.input_speech |= speech;
         if speech {
@@ -287,6 +302,40 @@ impl VoiceQueue {
         s.snapshot.speech_active = speech;
         if changed || Self::timers(&s) != previous {
             s.snapshot.revision += 1;
+        }
+    }
+
+    /// Every speech on/off edge while a phrase or its countdown is in flight,
+    /// including the counted silence an onset discards, capped per phrase.
+    fn log_speech_edge(s: &mut Inner, speech: bool) {
+        let now = Instant::now();
+        let since = s.activity.last_edge.replace(now).map(|at| now - at);
+        if speech && s.input_speech && s.silence_samples > 0 {
+            s.activity.resets += 1;
+        }
+        if !speech {
+            s.activity.last_speech_off = Some(now);
+        }
+        if !(s.input_speech || s.batch.is_some() || !s.pending.is_empty() || s.boundary_pending) {
+            return;
+        }
+        let phrase = s.input_phrase;
+        s.activity.lines += 1;
+        if s.activity.lines > MAX_ACTIVITY_LINES + 1 {
+            return;
+        }
+        if s.activity.lines > MAX_ACTIVITY_LINES {
+            log::info!(
+                "Voice phrase {phrase}: speech edge log capped at {MAX_ACTIVITY_LINES} lines"
+            );
+        } else if speech {
+            log::info!(
+                "Voice speech on (phrase {phrase}): {} ms silence counted, countdown resets {}, {since:?} since last edge",
+                ms(s.silence_samples),
+                s.activity.resets
+            );
+        } else {
+            log::info!("Voice speech off (phrase {phrase}): {since:?} since last edge");
         }
     }
 
@@ -357,6 +406,7 @@ impl VoiceQueue {
         s.boundary_pending = true;
         s.boundary_target = None;
         s.boundary_reserved_at = Some(Instant::now());
+        s.activity.off_to_reserve = s.activity.last_speech_off.map(|at| at.elapsed());
         Some(s.input_phrase)
     }
 
@@ -400,6 +450,8 @@ impl VoiceQueue {
             pasting: false,
             speech: s.input_speech,
             preview: s.input_text.clone(),
+            samples: s.input_samples,
+            committed_at: Instant::now(),
         };
         s.pending.push_back(pending);
         s.commands.push_back(VoiceCommand::Commit { phrase });
@@ -412,7 +464,13 @@ impl VoiceQueue {
             s.snapshot.status = Status::Committing;
         }
         s.snapshot.revision += 1;
-        log::info!("Voice phrase {phrase} committed {latency:?} after silence boundary");
+        let activity = std::mem::take(&mut s.activity);
+        s.activity.last_edge = activity.last_edge;
+        log::info!(
+            "Voice phrase {phrase} committed {latency:?} after silence boundary; last speech-off to reserve {:?}, countdown resets {}",
+            activity.off_to_reserve,
+            activity.resets
+        );
         self.wake.notify_one();
     }
 
@@ -490,14 +548,18 @@ impl VoiceQueue {
         };
         let text = sanitize(&text);
         let chars = meaningful_chars(&text);
+        let audio_ms = ms(pending.samples);
+        let decoded = pending.committed_at.elapsed();
         let text = if pending.speech && chars >= MIN_PHRASE_CHARS {
             log::info!(
-                "Voice phrase {phrase} final: {} chars",
+                "Voice phrase {phrase} final: {} chars, {audio_ms} ms audio, {decoded:?} after commit",
                 text.chars().count()
             );
             text
         } else {
-            log::info!("Voice phrase {phrase} dropped: {chars} letters/digits");
+            log::info!(
+                "Voice phrase {phrase} dropped: {chars} letters/digits, {audio_ms} ms audio, {decoded:?} after commit"
+            );
             String::new()
         };
         pending.text = Some(text.clone());
@@ -893,6 +955,29 @@ mod tests {
     fn silence(q: &VoiceQueue, samples: usize) {
         q.speech_activity(false);
         q.feed(&vec![0.; samples]);
+    }
+
+    /// Field diagnostics: every onset that discards counted silence is a reset,
+    /// whatever its length; counters and audio length belong to one phrase.
+    #[test]
+    fn voice_countdown_resets_are_counted_per_phrase() {
+        let q = queue();
+        q.speech_activity(true);
+        q.feed(&[1.]);
+        for _ in 0..30 {
+            silence(&q, 480);
+            q.speech_activity(true);
+        }
+        q.speech_activity(true); // not an edge
+        assert_eq!(lock(&q.inner).activity.resets, 30);
+        silence(&q, SILENCE_SAMPLES);
+        let phrase = q.reserve_silence_boundary().unwrap();
+        assert!(lock(&q.inner).activity.off_to_reserve.is_some());
+        q.commit_boundary();
+        q.set_target(phrase, target("A"));
+        let s = lock(&q.inner);
+        assert_eq!((s.activity.resets, s.activity.lines), (0, 0));
+        assert_eq!(s.pending[0].samples, 1 + 30 * 480 + SILENCE_SAMPLES);
     }
 
     #[test]

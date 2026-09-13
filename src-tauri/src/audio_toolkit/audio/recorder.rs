@@ -45,24 +45,46 @@ pub enum VadPolicy {
     Streaming,
 }
 
-/// A single VAD engine plus the two hangover-tail lengths its smoothing wrapper
-/// should use. The offline and streaming policies are never active
+/// A single VAD engine plus the settings its smoothing wrapper should use. The
+/// offline, streaming and voice-activity sessions are never active
 /// concurrently, so one detector is reconfigured per session (see `Cmd::Start`)
-/// rather than kept as two resident engines.
+/// rather than kept as several resident engines.
 #[derive(Clone)]
 struct VadConfig {
     detector: Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>,
+    threshold: f32,
+    onset_frames: usize,
     offline_hangover_frames: usize,
     streaming_hangover_frames: usize,
 }
 
+/// Speech threshold, onset and hangover (30 ms frames) for one session.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct VadProfile {
+    threshold: f32,
+    onset_frames: usize,
+    hangover_frames: usize,
+}
+
 impl VadConfig {
-    /// Post-speech hangover tail (in 30 ms frames) for the given policy.
-    /// `Disabled` never reaches the detector, so it maps to the offline value.
-    fn hangover_for(&self, policy: VadPolicy) -> usize {
-        match policy {
-            VadPolicy::Streaming => self.streaming_hangover_frames,
-            VadPolicy::Offline | VadPolicy::Disabled => self.offline_hangover_frames,
+    /// `Disabled` without retention is persistent voice mode: every frame goes
+    /// to the model and the detector only reports voice activity, so it gets
+    /// the strict voice profile. Every other session restores the normal one.
+    fn profile_for(&self, policy: VadPolicy, retain_samples: bool) -> VadProfile {
+        if policy == VadPolicy::Disabled && !retain_samples {
+            return VadProfile {
+                threshold: vad::VAD_VOICE_THRESHOLD,
+                onset_frames: vad::VAD_VOICE_ONSET_FRAMES,
+                hangover_frames: vad::VAD_VOICE_HANGOVER_FRAMES,
+            };
+        }
+        VadProfile {
+            threshold: self.threshold,
+            onset_frames: self.onset_frames,
+            hangover_frames: match policy {
+                VadPolicy::Streaming => self.streaming_hangover_frames,
+                VadPolicy::Offline | VadPolicy::Disabled => self.offline_hangover_frames,
+            },
         }
     }
 }
@@ -112,16 +134,21 @@ impl AudioRecorder {
     }
 
     /// Attach a single VAD engine, reconfigured per session for the offline vs
-    /// streaming hangover tail. The two policies are mutually exclusive within a
-    /// recording, so one engine covers both instead of two resident instances.
+    /// streaming hangover tail and the stricter voice-activity profile. The
+    /// sessions are mutually exclusive, so one engine covers all of them.
+    /// `threshold` and `onset_frames` are the normal (non-voice) settings.
     pub fn with_vad(
         mut self,
         detector: Box<dyn VoiceActivityDetector>,
+        threshold: f32,
+        onset_frames: usize,
         offline_hangover_frames: usize,
         streaming_hangover_frames: usize,
     ) -> Self {
         self.vad = Some(VadConfig {
             detector: Arc::new(Mutex::new(detector)),
+            threshold,
+            onset_frames,
             offline_hangover_frames,
             streaming_hangover_frames,
         });
@@ -749,6 +776,145 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// Silero's `prob > threshold` rule over scripted probabilities; records
+    /// every threshold the recorder configures.
+    struct ScriptedProbability {
+        probabilities: std::collections::VecDeque<f32>,
+        threshold: f32,
+        configured: Arc<std::sync::Mutex<Vec<f32>>>,
+    }
+
+    impl crate::audio_toolkit::VoiceActivityDetector for ScriptedProbability {
+        fn push_frame<'a>(
+            &'a mut self,
+            frame: &'a [f32],
+        ) -> anyhow::Result<crate::audio_toolkit::vad::VadFrame<'a>> {
+            use crate::audio_toolkit::vad::VadFrame;
+            let probability = self.probabilities.pop_front().unwrap_or(0.0);
+            Ok(if probability > self.threshold {
+                VadFrame::Speech(frame)
+            } else {
+                VadFrame::Noise
+            })
+        }
+
+        fn set_threshold(&mut self, threshold: f32) {
+            self.threshold = threshold;
+            self.configured.lock().unwrap().push(threshold);
+        }
+    }
+
+    struct VadRun {
+        activity: Vec<bool>,
+        retained: usize,
+    }
+
+    /// One consumer and one production-shaped detector (SmoothedVad over a
+    /// scripted probability source) across consecutive sessions, one 30 ms
+    /// frame per probability. Returns per-session results and the thresholds
+    /// configured at each `Cmd::Start`.
+    fn run_vad_sessions(sessions: &[(VadPolicy, bool, Vec<f32>)]) -> (Vec<VadRun>, Vec<f32>) {
+        use crate::audio_toolkit::vad::{
+            SmoothedVad, VAD_OFFLINE_HANGOVER_FRAMES, VAD_ONSET_FRAMES, VAD_PREFILL_FRAMES,
+            VAD_STREAMING_HANGOVER_FRAMES,
+        };
+        let configured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probabilities = sessions
+            .iter()
+            .flat_map(|(_, _, script)| script.iter().copied())
+            .collect();
+        let detector = SmoothedVad::new(
+            Box::new(ScriptedProbability {
+                probabilities,
+                threshold: crate::managers::audio::VAD_THRESHOLD,
+                configured: Arc::clone(&configured),
+            }),
+            VAD_PREFILL_FRAMES,
+            VAD_OFFLINE_HANGOVER_FRAMES,
+            VAD_ONSET_FRAMES,
+        );
+        let config = super::VadConfig {
+            detector: Arc::new(std::sync::Mutex::new(Box::new(detector))),
+            threshold: crate::managers::audio::VAD_THRESHOLD,
+            onset_frames: VAD_ONSET_FRAMES,
+            offline_hangover_frames: VAD_OFFLINE_HANGOVER_FRAMES,
+            streaming_hangover_frames: VAD_STREAMING_HANGOVER_FRAMES,
+        };
+        let activity = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&activity);
+        let (sample_tx, sample_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_consumer(
+                16_000,
+                Some(config),
+                sample_rx,
+                cmd_rx,
+                None,
+                None,
+                Some(Arc::new(move |speech| seen.lock().unwrap().push(speech))),
+                Arc::new(AtomicBool::new(false)),
+                Instant::now(),
+            )
+        });
+        let mut runs = Vec::new();
+        for (policy, retain, script) in sessions {
+            activity.lock().unwrap().clear();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            cmd_tx
+                .send(Cmd::Start(*policy, *retain, Instant::now(), ready_tx))
+                .unwrap();
+            sample_tx
+                .send(AudioChunk::Samples(vec![0.1; 480 * script.len()]))
+                .unwrap();
+            ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let (stop_tx, stop_rx) = mpsc::channel();
+            cmd_tx.send(Cmd::Stop(stop_tx)).unwrap();
+            sample_tx.send(AudioChunk::EndOfStream).unwrap();
+            sample_tx.send(AudioChunk::EndOfStream).unwrap();
+            let retained = stop_rx.recv_timeout(Duration::from_secs(1)).unwrap().len();
+            runs.push(VadRun {
+                activity: activity.lock().unwrap().clone(),
+                retained,
+            });
+        }
+        cmd_tx.send(Cmd::Shutdown).unwrap();
+        worker.join().unwrap();
+        let configured = configured.lock().unwrap().clone();
+        (runs, configured)
+    }
+
+    #[test]
+    fn voice_activity_needs_five_frames_above_0_7_and_normal_sessions_keep_0_3() {
+        let mut voice = vec![0.9; 4]; // a 120 ms click
+        voice.extend([0.0; 3]);
+        voice.extend([0.6; 10]); // steady room noise
+        voice.extend([0.9; 5]); // real speech: starts on the fifth frame
+        voice.extend([0.0; 16]);
+        let (runs, thresholds) = run_vad_sessions(&[
+            (VadPolicy::Offline, true, vec![0.35]),
+            (VadPolicy::Disabled, false, voice.clone()),
+            (VadPolicy::Offline, true, vec![0.35, 0.35]),
+        ]);
+        assert_eq!(thresholds, [0.3, 0.7, 0.3]);
+
+        // Normal push-to-talk: one frame above 0.3 is still onset, two start speech.
+        assert_eq!(runs[0].retained, 0);
+        assert!(
+            runs[2].retained > 0,
+            "voice profile leaked into next session"
+        );
+
+        let activity = &runs[1].activity;
+        assert_eq!(activity.len(), voice.len());
+        assert_eq!(runs[1].retained, 0);
+        let start = 4 + 3 + 10 + 4;
+        assert_eq!(activity.iter().position(|speech| *speech), Some(start));
+        // 15-frame (450 ms) tail, never the 55-frame streaming one.
+        assert!(activity[start..=start + 15].iter().all(|speech| *speech));
+        assert!(!activity[start + 16]);
+    }
+
     #[test]
     fn voice_marker_waits_for_inflight_producer_before_enqueue() {
         let (tx, rx) = mpsc::sync_channel(8);
@@ -954,8 +1120,11 @@ fn run_consumer(
                     // any frames.
                     if vad_policy != VadPolicy::Disabled || !retain_samples {
                         if let Some(cfg) = &vad {
+                            let profile = cfg.profile_for(vad_policy, retain_samples);
                             let mut det = cfg.detector.lock().unwrap();
-                            det.set_hangover_frames(cfg.hangover_for(vad_policy));
+                            det.set_threshold(profile.threshold);
+                            det.set_onset_frames(profile.onset_frames);
+                            det.set_hangover_frames(profile.hangover_frames);
                             det.reset();
                         }
                     }

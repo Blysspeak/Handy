@@ -187,6 +187,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let recorder = AudioRecorder::new()?.with_vad(
         Box::new(smoothed_vad),
+        0.5,
+        VAD_ONSET_FRAMES,
         VAD_OFFLINE_HANGOVER_FRAMES,
         VAD_STREAMING_HANGOVER_FRAMES,
     );

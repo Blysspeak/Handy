@@ -55,20 +55,6 @@
   background: #929aa6;
 }
 
-.voice-silence {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 2px;
-  background: rgba(185, 213, 203, 0.55);
-  transform-origin: left;
-}
-
-.voice-silence[data-kind="send"] {
-  background: rgba(227, 195, 149, 0.6);
-}
-
 .voice-panel[data-speech="true"] .voice-dot {
   background: #b9d5cb;
 }

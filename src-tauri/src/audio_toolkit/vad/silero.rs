@@ -50,6 +50,10 @@ impl VoiceActivityDetector for SileroVad {
         }
     }
 
+    fn set_threshold(&mut self, threshold: f32) {
+        self.threshold = threshold.clamp(0.0, 1.0);
+    }
+
     fn reset(&mut self) {
         // Clear the Silero LSTM hidden/cell state so a new session doesn't
         // inherit recurrent context from the previous recording.

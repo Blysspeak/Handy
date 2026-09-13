@@ -203,16 +203,6 @@ export default function VoiceOverlay({
   const status = recoverable
     ? t(`voice.errors.${errorKey}`)
     : t(`voice.${statusKey}`);
-  const ratio = (remaining: number | null | undefined, total: number) =>
-    listening &&
-    !snapshot.speech_active &&
-    typeof remaining === "number" &&
-    Number.isFinite(remaining)
-      ? Math.max(0, Math.min(1, remaining / total))
-      : null;
-  // 1 s to paste the phrase; the send tail before Enter is only a few hundred ms.
-  const pasteRatio = ratio(snapshot.silence_remaining_ms, 1000);
-  const silenceRatio = pasteRatio ?? ratio(snapshot.send_remaining_ms, 3000);
 
   return (
     <div className="voice-stage">
@@ -288,14 +278,6 @@ export default function VoiceOverlay({
             </button>
             {copyState !== "idle" && <span>{t(`voice.${copyState}`)}</span>}
           </div>
-        )}
-        {silenceRatio !== null && (
-          <span
-            className="voice-silence"
-            data-kind={pasteRatio === null ? "send" : "paste"}
-            aria-hidden="true"
-            style={{ transform: `scaleX(${silenceRatio})` }}
-          />
         )}
       </div>
     </div>

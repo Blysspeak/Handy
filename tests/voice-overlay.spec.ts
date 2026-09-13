@@ -551,7 +551,20 @@ test("level redraw is bounded and generation/status changes clean pending teleme
   }
 });
 
-test("silence strip follows snapshot revisions only and telemetry preserves text scroll", async ({
+/** No countdown strip, nor any other element pinned to the panel's bottom edge. */
+async function expectNoStrip(page: Page) {
+  await expect(page.locator(".voice-silence, [data-kind]")).toHaveCount(0);
+  expect(
+    await page.locator(".voice-panel").evaluate((panel) =>
+      [...panel.querySelectorAll("*")].some((el) => {
+        const style = getComputedStyle(el);
+        return style.position === "absolute" && style.bottom === "0px";
+      }),
+    ),
+  ).toBe(false);
+}
+
+test("paste countdown draws no strip and telemetry preserves text scroll", async ({
   page,
 }) => {
   await setup(page);
@@ -563,11 +576,11 @@ test("silence strip follows snapshot revisions only and telemetry preserves text
   await text.evaluate((el) => {
     el.scrollTop = 0;
   });
-  const strip = page.locator(".voice-silence");
   for (const [revision, remaining] of [
-    [3, 500],
-    [4, 1],
-    [5, 0],
+    [3, 1000],
+    [4, 500],
+    [5, 1],
+    [6, 0],
   ]) {
     await emit(page, {
       revision,
@@ -575,130 +588,60 @@ test("silence strip follows snapshot revisions only and telemetry preserves text
       committed,
       silence_remaining_ms: remaining,
     });
-    await expect(strip).toHaveAttribute("aria-hidden", "true");
-    expect(
-      await strip.evaluate((el) => (el as HTMLElement).style.transform),
-    ).toBe(`scaleX(${remaining / 1000})`);
-    expect(await strip.evaluate((el) => getComputedStyle(el).height)).toBe(
-      "2px",
-    );
+    await expectNoStrip(page);
     await page.clock.runFor(1500);
-    expect(
-      await strip.evaluate((el) => (el as HTMLElement).style.transform),
-    ).toBe(`scaleX(${remaining / 1000})`);
+    await expectNoStrip(page);
     expect(await text.evaluate((el) => el.scrollTop)).toBe(0);
     await expect(text).toHaveText(committed);
   }
-  await emit(page, {
-    revision: 4,
-    status: "listening",
-    committed,
-    silence_remaining_ms: 1000,
-  });
-  expect(
-    await strip.evaluate((el) => (el as HTMLElement).style.transform),
-  ).toBe("scaleX(0)");
-  await emit(page, {
-    revision: 6,
-    status: "listening",
-    committed,
-    silence_remaining_ms: null,
-  });
-  await expect(strip).toHaveCount(0);
-  await emit(page, {
-    revision: 5,
-    status: "listening",
-    committed,
-    silence_remaining_ms: 500,
-  });
-  await expect(strip).toHaveCount(0);
-  await emit(page, {
-    revision: 7,
-    status: "listening",
-    committed,
-    speech_active: true,
-    silence_remaining_ms: 500,
-  });
-  await expect(strip).toHaveCount(0);
-  await emit(page, {
-    revision: 8,
-    status: "committing",
-    committed,
-    silence_remaining_ms: 500,
-  });
-  await expect(strip).toHaveCount(0);
   await emit(page, { generation: 5, revision: 1, status: "listening" });
-  await expect(strip).toHaveCount(0);
+  await expectNoStrip(page);
   expect(await page.locator(".voice-panel").boundingBox()).toMatchObject({
     width: 380,
     height: 42,
   });
 });
 
-test("send strip counts 3 s to Enter after paste and hides on speech or phrase", async ({
+test("send countdown to Enter draws no strip and keeps the hint", async ({
   page,
 }) => {
   await setup(page, "en");
   await emit(page, { revision: 2, status: "listening" });
-  const strip = page.locator(".voice-silence");
-  await expect(strip).toHaveCount(0);
+  await expectNoStrip(page);
+  for (const [revision, change] of [
+    [3, { send_remaining_ms: 1500 }],
+    [4, { send_remaining_ms: 0 }],
+    [5, { speech_active: true, send_remaining_ms: 1500 }],
+  ] as const) {
+    await emit(page, { revision, status: "listening", ...change });
+    await expectNoStrip(page);
+  }
   await emit(page, {
-    revision: 3,
+    revision: 6,
     status: "listening",
-    send_remaining_ms: 1500,
+    send_remaining_ms: 3000,
   });
-  await expect(strip).toHaveAttribute("data-kind", "send");
-  expect(
-    await strip.evaluate((el) => (el as HTMLElement).style.transform),
-  ).toBe("scaleX(0.5)");
-  expect(
-    await strip.evaluate((el) => getComputedStyle(el).backgroundColor),
-  ).not.toBe(
-    await page.evaluate(() => {
-      const probe = document.createElement("span");
-      probe.className = "voice-silence";
-      document.querySelector(".voice-panel")?.appendChild(probe);
-      const color = getComputedStyle(probe).backgroundColor;
-      probe.remove();
-      return color;
-    }),
-  );
   await expect(page.locator(".voice-hint")).toHaveText(
     "Pause 1s pastes and sends",
   );
   await emit(page, {
-    revision: 4,
-    status: "listening",
-    speech_active: true,
-    send_remaining_ms: 1500,
-  });
-  await expect(strip).toHaveCount(0);
-  await emit(page, {
-    revision: 5,
+    revision: 7,
     status: "listening",
     committed: "next phrase",
     silence_remaining_ms: 250,
-    send_remaining_ms: null,
   });
-  await expect(strip).toHaveAttribute("data-kind", "paste");
-  expect(
-    await strip.evaluate((el) => (el as HTMLElement).style.transform),
-  ).toBe("scaleX(0.25)");
+  await expectNoStrip(page);
   await emit(page, {
-    revision: 6,
+    revision: 8,
     status: "committing",
     committed: "next phrase",
     send_remaining_ms: 3000,
   });
-  await expect(strip).toHaveCount(0);
-  await emit(page, { revision: 7, status: "listening", send_remaining_ms: 0 });
-  expect(
-    await strip.evaluate((el) => (el as HTMLElement).style.transform),
-  ).toBe("scaleX(0)");
+  await expectNoStrip(page);
 });
 
 for (const theme of ["light", "dark"]) {
-  test(`synthetic waveform and captured silence screenshots on ${theme}`, async ({
+  test(`synthetic waveform and strip-free silence screenshots on ${theme}`, async ({
     page,
   }) => {
     await setup(page);
@@ -728,6 +671,7 @@ for (const theme of ["light", "dark"]) {
     });
     await page.evaluate(() => window.__voiceLevels(Array(16).fill(0)));
     await page.clock.runFor(34);
+    await expectNoStrip(page);
     await page.screenshot({
       path: `/tmp/diktor-wave-${theme}-half-silence.png`,
     });
@@ -737,7 +681,8 @@ for (const theme of ["light", "dark"]) {
       error: "target_changed",
       draft: "Мини-волна отражает реальный звук",
     });
-    await expect(page.locator(".voice-levels, .voice-silence")).toHaveCount(0);
+    await expect(page.locator(".voice-levels")).toHaveCount(0);
+    await expectNoStrip(page);
     await page.screenshot({ path: `/tmp/diktor-wave-${theme}-draft.png` });
   });
 }

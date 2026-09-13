@@ -18,7 +18,9 @@ use std::time::{Duration, Instant};
 use tauri::{Emitter, Manager};
 
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const VAD_THRESHOLD: f32 = 0.5;
+/// Push-to-talk and streaming preview; persistent voice mode applies its own
+/// stricter profile (`VAD_VOICE_*`) per session in the recorder.
+pub(crate) const VAD_THRESHOLD: f32 = 0.3;
 
 fn set_mute(mute: bool) {
     // Expected behavior:
@@ -302,6 +304,8 @@ fn create_audio_recorder(
         .map_err(|e| anyhow::anyhow!("Failed to create AudioRecorder: {}", e))?
         .with_vad(
             Box::new(smoothed_vad),
+            VAD_THRESHOLD,
+            VAD_ONSET_FRAMES,
             VAD_OFFLINE_HANGOVER_FRAMES,
             VAD_STREAMING_HANGOVER_FRAMES,
         )
