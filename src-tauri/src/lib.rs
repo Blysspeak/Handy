@@ -57,16 +57,17 @@ fn voice_session_snapshot(
 }
 
 #[tauri::command]
-fn voice_overlay_height(
+fn voice_overlay_size(
     app: AppHandle,
     manager: tauri::State<'_, Arc<VoiceSessionManager>>,
     generation: u64,
+    width: f64,
     height: f64,
 ) {
     if manager.snapshot().is_some_and(|s| {
         s.generation == generation && s.status != voice_session::state::Status::Off
     }) {
-        overlay::resize_voice_overlay(&app, height);
+        overlay::resize_voice_overlay(&app, width, height);
     }
 }
 
@@ -802,7 +803,7 @@ pub fn run(cli_args: CliArgs) {
     let invoke_handler = specta_builder.invoke_handler();
     let voice_invoke_handler: fn(tauri::ipc::Invoke<tauri::Wry>) -> bool = tauri::generate_handler![
         voice_session_snapshot,
-        voice_overlay_height,
+        voice_overlay_size,
         voice_copy_draft,
         voice_dismiss
     ];
@@ -1085,7 +1086,7 @@ pub fn run(cli_args: CliArgs) {
         })
         .invoke_handler(move |invoke| match invoke.message.command() {
             "voice_session_snapshot"
-            | "voice_overlay_height"
+            | "voice_overlay_size"
             | "voice_copy_draft"
             | "voice_dismiss" => voice_invoke_handler(invoke),
             _ => invoke_handler(invoke),

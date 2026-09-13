@@ -2,7 +2,6 @@
   "voice": {
     "loading": "Connecting…",
     "listening": "Listening",
-    "sendHint": "Pause 1s pastes and sends",
     "speech": "Hearing speech…",
     "committing": "Sending…",
     "stopping": "Stopping…",

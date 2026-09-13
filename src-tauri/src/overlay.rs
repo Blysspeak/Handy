@@ -59,6 +59,30 @@ fn overlay_dimensions(state: &str) -> (f64, f64) {
     }
 }
 
+// Voice overlay window bounds (logical px), kept in sync with VoiceOverlay.css:
+// the droplet (.voice-drop) alone is the smallest window; droplet + 6px gap +
+// 320px text bubble (max 140px tall) is the largest.
+const VOICE_DROPLET_WIDTH: f64 = 24.0;
+const VOICE_DROPLET_HEIGHT: f64 = 32.0;
+const VOICE_WINDOW_MAX_WIDTH: f64 = 350.0;
+const VOICE_WINDOW_MAX_HEIGHT: f64 = 140.0;
+
+/// Native voice window size for the stage size the frontend reports, so the
+/// window is only as large as the droplet and the bubble actually shown.
+fn voice_overlay_size(width: f64, height: f64) -> Option<(i32, i32)> {
+    if !width.is_finite() || !height.is_finite() {
+        return None;
+    }
+    Some((
+        width
+            .ceil()
+            .clamp(VOICE_DROPLET_WIDTH, VOICE_WINDOW_MAX_WIDTH) as i32,
+        height
+            .ceil()
+            .clamp(VOICE_DROPLET_HEIGHT, VOICE_WINDOW_MAX_HEIGHT) as i32,
+    ))
+}
+
 static LAST_MIC_LEVEL_EMIT: AtomicU64 = AtomicU64::new(0);
 const EMIT_THROTTLE_MS: u64 = 33; // ~30 FPS
 
@@ -740,7 +764,10 @@ pub fn show_voice_overlay(app: &AppHandle) -> Result<(), String> {
                 apply_cursor_monitor(&app_handle, &gtk_window)?;
                 let was_active = VOICE_OVERLAY_ACTIVE.swap(true, Ordering::AcqRel);
                 if !was_active {
-                    gtk_window.set_size_request(380, 42);
+                    // Startup is "loading", which shows the droplet alone; the frontend
+                    // reports any larger size (bubble) via voice_overlay_size.
+                    gtk_window
+                        .set_size_request(VOICE_DROPLET_WIDTH as i32, VOICE_DROPLET_HEIGHT as i32);
                     gtk_window.resize(1, 1);
                     // Cursor-follow for the rest of this voice session: self-stops
                     // (Break) once VOICE_OVERLAY_ACTIVE goes false, so no explicit
@@ -779,8 +806,8 @@ pub fn show_voice_overlay(app: &AppHandle) -> Result<(), String> {
     }
 }
 
-/// Moves the layer-shell surface to the cursor's monitor and re-anchors it to
-/// that monitor's outer edge. No-op when the cursor is still on the same
+/// Moves the layer-shell surface to the cursor's monitor and anchors it to that
+/// monitor's bottom-right corner. No-op when the cursor is still on the same
 /// monitor as last time, so the 200ms poll doesn't hit GTK on every tick.
 #[cfg(target_os = "linux")]
 fn apply_cursor_monitor(
@@ -802,56 +829,43 @@ fn apply_cursor_monitor(
     }
 
     let display = gtk::gdk::Display::default().ok_or("desktop")?;
-    let monitors: Vec<_> = (0..display.n_monitors())
+    let monitor = (0..display.n_monitors())
         .filter_map(|i| display.monitor(i))
-        .collect();
-    let monitor = monitors
-        .iter()
         .find(|monitor| {
             let geometry = monitor.geometry();
             geometry.x() == cursor_x && geometry.y() == cursor_y
         })
         .ok_or("target_unavailable")?;
-    gtk_window.set_monitor(monitor);
+    gtk_window.set_monitor(&monitor);
     gtk_window.set_keyboard_mode(KeyboardMode::None);
-    let monitor_xs: Vec<i32> = monitors.iter().map(|m| m.geometry().x()).collect();
-    let hug_left = anchor_left(cursor_x, &monitor_xs);
     gtk_window.set_anchor(Edge::Top, false);
-    gtk_window.set_anchor(Edge::Left, hug_left);
+    gtk_window.set_anchor(Edge::Left, false);
     gtk_window.set_anchor(Edge::Bottom, true);
-    gtk_window.set_anchor(Edge::Right, !hug_left);
+    gtk_window.set_anchor(Edge::Right, true);
     gtk_window.set_layer_shell_margin(Edge::Bottom, 24);
-    gtk_window.set_layer_shell_margin(Edge::Left, if hug_left { 24 } else { 0 });
-    gtk_window.set_layer_shell_margin(Edge::Right, if hug_left { 0 } else { 24 });
+    // Flush with the screen edge; the bottom-right anchor keeps the
+    // droplet in place while the window grows leftward/upward.
+    gtk_window.set_layer_shell_margin(Edge::Right, 0);
     gtk_window.set_layer_shell_margin(Edge::Top, 0);
     LAST_CURSOR_MONITOR_X.store(cursor_x, Ordering::Release);
     LAST_CURSOR_MONITOR_Y.store(cursor_y, Ordering::Release);
     Ok(())
 }
 
-/// True when `target_x` is the strict leftmost of the connected monitors and
-/// at least one other monitor sits at a different x — a real side-by-side
-/// layout where the panel should hug the left edge instead of the default
-/// right edge that fits a single monitor or the rightmost of several.
-#[cfg(target_os = "linux")]
-fn anchor_left(target_x: i32, monitor_xs: &[i32]) -> bool {
-    match monitor_xs.iter().copied().min() {
-        Some(min_x) => target_x == min_x && monitor_xs.iter().any(|&x| x != target_x),
-        None => false,
-    }
-}
-
-pub fn resize_voice_overlay(app: &AppHandle, height: f64) {
+pub fn resize_voice_overlay(app: &AppHandle, width: f64, height: f64) {
+    let Some((width, height)) = voice_overlay_size(width, height) else {
+        return;
+    };
     let app_handle = app.clone();
     let _ = app.run_on_main_thread(move || {
-        if !VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire) || !height.is_finite() {
+        if !VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire) {
             return;
         }
         #[cfg(target_os = "linux")]
         if let Some(window) = app_handle.get_webview_window("recording_overlay") {
             use gtk::prelude::*;
             if let Ok(window) = window.gtk_window() {
-                window.set_size_request(380, height.ceil().clamp(42.0, 140.0) as i32);
+                window.set_size_request(width, height);
                 window.resize(1, 1);
             }
         }
@@ -959,6 +973,16 @@ mod tests {
     }
 
     #[test]
+    fn voice_overlay_size_spans_droplet_to_droplet_with_bubble() {
+        assert_eq!(voice_overlay_size(24.0, 32.0), Some((24, 32)));
+        assert_eq!(voice_overlay_size(350.0, 51.2), Some((350, 52)));
+        assert_eq!(voice_overlay_size(1.0, 1.0), Some((24, 32)));
+        assert_eq!(voice_overlay_size(900.0, 600.0), Some((350, 140)));
+        assert_eq!(voice_overlay_size(f64::NAN, 32.0), None);
+        assert_eq!(voice_overlay_size(350.0, f64::INFINITY), None);
+    }
+
+    #[test]
     fn monitor_hit_test_uses_half_open_physical_bounds() {
         let position = PhysicalPosition::new(-2560, -200);
         let size = PhysicalSize::new(2560, 1440);
@@ -967,14 +991,6 @@ mod tests {
         assert!(is_mouse_within_monitor((-1, 1239), &position, &size));
         assert!(!is_mouse_within_monitor((0, 0), &position, &size));
         assert!(!is_mouse_within_monitor((-1, 1240), &position, &size));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn voice_overlay_hugs_left_only_as_the_leftmost_of_several_monitors() {
-        assert!(!anchor_left(0, &[0]));
-        assert!(anchor_left(0, &[0, 2560]));
-        assert!(!anchor_left(2560, &[0, 2560]));
     }
 
     #[cfg(target_os = "windows")]

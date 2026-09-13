@@ -1,10 +1,18 @@
 @import "../styles/theme.css";
 
+/* Pinned to the window's bottom-right corner, which the layer surface anchors
+   flush to the screen's right edge: the droplet stays put while the window
+   grows for the failure bubble. Fixed widths keep the stage size independent of the
+   window size. Keep 24x32, the 6px gap and the 320px bubble in sync with
+   VOICE_* in overlay.rs. */
 .voice-stage {
   position: fixed;
   right: 0;
   bottom: 0;
-  width: 380px;
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  width: max-content;
   font:
     14px/20px "Noto Sans",
     system-ui,
@@ -14,58 +22,114 @@
   color-scheme: dark;
 }
 
-.voice-panel {
-  position: relative;
+/* A half-pill tab flush with the screen edge; its dot colour is the state. */
+.voice-drop {
+  --tone: #7f8793;
+  --tone-glow: transparent;
+  --tone-edge: rgba(241, 243, 245, 0.12);
   display: flex;
-  flex-direction: column;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
   box-sizing: border-box;
-  min-height: 42px;
-  max-height: 140px;
-  padding: 10px 14px 10px 30px;
-  border: 1px solid rgba(241, 243, 245, 0.12);
-  border-radius: 12px;
-  background: rgba(26, 29, 33, 0.89);
-  box-shadow: inset 0 1px 8px rgba(255, 255, 255, 0.035);
-  overflow: hidden;
+  width: 24px;
+  height: 32px;
+  padding-left: 2px;
+  border: 1px solid var(--tone-edge);
+  border-right: 0;
+  border-radius: 16px 0 0 16px;
+  background: rgba(26, 29, 33, 0.65);
+  transition:
+    border-color 150ms ease,
+    background-color 150ms ease;
 }
 
-.voice-dot {
-  position: absolute;
-  left: 13px;
-  top: 17px;
+.voice-drop::before {
+  content: "";
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: #929aa6;
+  background: var(--tone);
+  box-shadow: 0 0 5px var(--tone-glow);
+  transition:
+    background-color 150ms ease,
+    box-shadow 150ms ease;
 }
 
-.voice-levels {
-  position: absolute;
-  left: 9px;
-  top: 10px;
-  height: 20px;
+.voice-drop[data-tone="speech"] {
+  --tone: #34d399;
+  --tone-glow: rgba(52, 211, 153, 0.85);
+  --tone-edge: rgba(52, 211, 153, 0.45);
+  background: rgba(18, 46, 36, 0.75);
+}
+
+/* Breathing glow while speech is heard: only brightness, never size or position. */
+.voice-drop[data-tone="speech"]::before {
+  animation: voice-pulse 1.1s ease-in-out infinite alternate;
+}
+
+@keyframes voice-pulse {
+  from {
+    box-shadow: 0 0 2px var(--tone-glow);
+    opacity: 0.75;
+  }
+  to {
+    box-shadow: 0 0 9px var(--tone-glow);
+    opacity: 1;
+  }
+}
+
+.voice-drop[data-tone="sending"] {
+  --tone: #a9bddb;
+  --tone-glow: rgba(169, 189, 219, 0.5);
+  --tone-edge: rgba(169, 189, 219, 0.28);
+}
+
+.voice-drop[data-tone="error"] {
+  --tone: #e3c395;
+  --tone-glow: rgba(227, 195, 149, 0.5);
+  --tone-edge: rgba(227, 195, 149, 0.3);
+}
+
+/* Failure bubble (message, draft, Copy) left of the droplet, bottom-aligned;
+   only its opacity animates. */
+.voice-bubble {
   display: flex;
-  align-items: center;
-  gap: 1px;
+  flex: 0 0 320px;
+  flex-direction: column;
+  box-sizing: border-box;
+  width: 320px;
+  min-height: 32px;
+  max-height: 140px;
+  padding: 5px 12px;
+  border: 1px solid rgba(241, 243, 245, 0.12);
+  border-radius: 12px;
+  background: rgba(26, 29, 33, 0.88);
+  box-shadow: inset 0 1px 8px rgba(255, 255, 255, 0.035);
+  overflow: hidden;
+  animation: voice-fade-in 150ms ease-out;
+  transition: opacity 150ms ease-in;
 }
 
-.voice-levels > span {
-  width: 2px;
-  border-radius: 1px;
-  background: #929aa6;
+.voice-bubble[data-leaving="true"] {
+  opacity: 0;
+  pointer-events: none;
 }
 
-.voice-panel[data-speech="true"] .voice-dot {
-  background: #b9d5cb;
+@keyframes voice-fade-in {
+  from {
+    opacity: 0;
+  }
 }
 
-.voice-panel[data-status="committing"] .voice-dot {
-  background: #e3c395;
-}
-
-.voice-panel[data-status="error"] .voice-dot,
-.voice-panel[data-status="draft"] .voice-dot {
-  background: #e3aaa1;
+@media (prefers-reduced-motion: reduce) {
+  .voice-drop,
+  .voice-drop::before,
+  .voice-drop[data-tone="speech"]::before,
+  .voice-bubble {
+    animation: none;
+    transition: none;
+  }
 }
 
 .voice-text {
@@ -78,46 +142,10 @@
   flex: 1 1 auto;
 }
 
-.voice-tentative {
-  color: #ccd0d6;
-}
-
 .voice-status {
   flex: 0 0 auto;
   color: #bbc1c9;
   overflow-wrap: anywhere;
-}
-
-.voice-idle-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  min-width: 0;
-  height: 20px;
-  white-space: nowrap;
-}
-
-.voice-idle-row .voice-status {
-  color: #dfe3e8;
-}
-
-.voice-hint {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  color: #abb2bc;
-  font-size: 11px;
-  line-height: 18px;
-}
-
-.voice-hint kbd {
-  padding: 0 4px;
-  border: 1px solid rgba(241, 243, 245, 0.16);
-  border-radius: 4px;
-  background: rgba(241, 243, 245, 0.05);
-  font: inherit;
-  line-height: 16px;
 }
 
 .voice-text + .voice-status {
@@ -133,6 +161,7 @@
   align-items: center;
   gap: 4px 6px;
   margin-top: 4px;
+  margin-bottom: 2px;
   font-size: 12px;
   line-height: 18px;
 }

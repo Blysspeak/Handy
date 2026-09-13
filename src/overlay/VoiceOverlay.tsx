@@ -26,21 +26,48 @@ export interface VoiceSnapshot {
   send_remaining_ms: number | null;
 }
 
-const EMPTY_LEVELS = [0, 0, 0, 0, 0];
+/** Bubble fade duration; keep in sync with VoiceOverlay.css. */
+const FADE_MS = 150;
 
-function groupLevels(payload: unknown): number[] {
-  const buckets = Array.isArray(payload) ? payload : [];
-  return EMPTY_LEVELS.map((_, bar) => {
-    const start = Math.floor((bar * 16) / 5);
-    const end = Math.floor(((bar + 1) * 16) / 5);
-    let sum = 0;
-    for (let i = start; i < end; i++) {
-      const level: unknown = buckets[i];
-      if (typeof level === "number" && Number.isFinite(level))
-        sum += Math.max(0, Math.min(1, level));
-    }
-    return sum / (end - start);
-  });
+const KNOWN_ERRORS = [
+  "target_changed",
+  "target_unavailable",
+  "unsupported_desktop",
+  "backlog",
+  "model",
+  "out_of_memory",
+  "unsupported_model",
+  "microphone",
+  "timeout",
+  "desktop",
+  "busy",
+  "cancelled",
+  "delivery_uncertain",
+];
+
+type Tone = "neutral" | "speech" | "sending" | "error";
+
+function toneOf(snapshot: VoiceSnapshot): Tone {
+  switch (snapshot.status) {
+    case "listening":
+      return snapshot.speech_active ? "speech" : "neutral";
+    case "committing":
+      return "sending";
+    case "draft":
+    case "error":
+      return "error";
+    default:
+      return "neutral";
+  }
+}
+
+/** What the failure bubble shows; kept after it hides so it can fade out intact. */
+interface Bubble {
+  generation: number;
+  phrase: number;
+  text: string;
+  message: string;
+  copyable: boolean;
 }
 
 export function useVoiceSession() {
@@ -88,56 +115,13 @@ export default function VoiceOverlay({
   snapshot: VoiceSnapshot | null;
 }) {
   const { t } = useTranslation();
-  const card = useRef<HTMLDivElement>(null);
+  const stage = useRef<HTMLDivElement>(null);
   const text = useRef<HTMLDivElement>(null);
   const [copyState, setCopyState] = useState<"idle" | "copied" | "copyFailed">(
     "idle",
   );
   const generation = snapshot?.generation;
   const phrase = snapshot?.phrase;
-  const listening = snapshot?.status === "listening";
-  const [levels, setLevels] = useState(EMPTY_LEVELS);
-  useEffect(() => {
-    setLevels(EMPTY_LEVELS);
-    if (!listening) return;
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    let redraw: ReturnType<typeof setTimeout> | undefined;
-    let stale: ReturnType<typeof setTimeout> | undefined;
-    let pending = EMPTY_LEVELS;
-    let lastDraw = -Infinity;
-    const draw = () => {
-      redraw = undefined;
-      lastDraw = performance.now();
-      setLevels(pending);
-    };
-    void listen<unknown>("mic-level", ({ payload }) => {
-      if (disposed) return;
-      pending = groupLevels(payload);
-      if (redraw === undefined) {
-        const delay = Math.max(0, 1000 / 30 - (performance.now() - lastDraw));
-        if (delay === 0) draw();
-        else redraw = setTimeout(draw, delay);
-      }
-      clearTimeout(stale);
-      stale = setTimeout(() => {
-        clearTimeout(redraw);
-        redraw = undefined;
-        setLevels(EMPTY_LEVELS);
-      }, 250);
-    })
-      .then((stop) => {
-        if (disposed) stop();
-        else unlisten = stop;
-      })
-      .catch(() => {});
-    return () => {
-      disposed = true;
-      unlisten?.();
-      clearTimeout(redraw);
-      clearTimeout(stale);
-    };
-  }, [generation, listening]);
   const identity = useRef("");
   identity.current = `${generation}:${phrase}`;
   useEffect(() => {
@@ -150,97 +134,79 @@ export default function VoiceOverlay({
     generation,
     phrase,
     snapshot?.committed,
-    snapshot?.tentative,
     snapshot?.draft,
     snapshot?.status,
   ]);
   useLayoutEffect(() => {
-    const element = card.current;
+    const element = stage.current;
     if (!element || generation === undefined) return;
+    // The stage is droplet (+ gap + fixed-width bubble), so its size never
+    // depends on the window size and reporting it cannot start a resize loop.
     const observer = new ResizeObserver(() => {
-      void invoke("voice_overlay_height", {
-        generation,
-        height: element.getBoundingClientRect().height,
-      }).catch(() => {});
+      const { width, height } = element.getBoundingClientRect();
+      void invoke("voice_overlay_size", { generation, width, height }).catch(
+        () => {},
+      );
     });
     observer.observe(element);
     return () => observer.disconnect();
   }, [generation, snapshot?.status]);
 
+  let status = "";
+  let current: Bubble | null = null;
+  if (snapshot?.status === "draft" || snapshot?.status === "error") {
+    const errorKey =
+      snapshot.error && KNOWN_ERRORS.includes(snapshot.error)
+        ? snapshot.error
+        : "model";
+    status = t(`voice.errors.${errorKey}`);
+    // Normal dictation is shown only by the droplet colour; the bubble exists
+    // for failures, where the draft and its copy button must stay reachable.
+    current = {
+      generation: snapshot.generation,
+      phrase: snapshot.phrase,
+      text: snapshot.draft || snapshot.committed,
+      message: status,
+      copyable: snapshot.draft.length > 0,
+    };
+  } else if (snapshot && snapshot.status !== "off") {
+    status = t(
+      `voice.${snapshot.status === "listening" && snapshot.speech_active ? "speech" : snapshot.status}`,
+    );
+  }
+  const shown = current !== null;
+  const last = useRef<Bubble | null>(null);
+  if (current) last.current = current;
+  const [lingering, setLingering] = useState(false);
+  useEffect(() => {
+    if (shown) {
+      setLingering(true);
+      return;
+    }
+    const timer = setTimeout(() => setLingering(false), FADE_MS);
+    return () => clearTimeout(timer);
+  }, [shown]);
+
   if (!snapshot || snapshot.status === "off") return null;
-  const recoverable =
-    snapshot.status === "draft" || snapshot.status === "error";
-  const committed = recoverable
-    ? snapshot.draft || snapshot.committed
-    : snapshot.committed;
-  const tentative = recoverable ? "" : snapshot.tentative;
-  const hasText = committed.length > 0 || tentative.length > 0;
-  const isIdle =
-    snapshot.status === "listening" && !snapshot.speech_active && !hasText;
-  const statusKey =
-    snapshot.status === "listening" && snapshot.speech_active
-      ? "speech"
-      : snapshot.status;
-  const knownErrors = [
-    "target_changed",
-    "target_unavailable",
-    "unsupported_desktop",
-    "backlog",
-    "model",
-    "out_of_memory",
-    "unsupported_model",
-    "microphone",
-    "timeout",
-    "desktop",
-    "busy",
-    "cancelled",
-    "delivery_uncertain",
-  ];
-  const errorKey =
-    snapshot.error && knownErrors.includes(snapshot.error)
-      ? snapshot.error
-      : "model";
-  const status = recoverable
-    ? t(`voice.errors.${errorKey}`)
-    : t(`voice.${statusKey}`);
+  const bubble =
+    current ??
+    (lingering && last.current?.generation === snapshot.generation
+      ? last.current
+      : null);
+  const leaving = current === null && bubble !== null;
 
   return (
-    <div className="voice-stage">
-      <div
-        ref={card}
-        className="voice-panel"
-        data-status={snapshot.status}
-        data-speech={snapshot.speech_active}
-        role="status"
-        aria-live="polite"
-      >
-        {listening ? (
-          <span className="voice-levels" aria-hidden="true">
-            {levels.map((level, index) => (
-              <span key={index} style={{ height: `${2 + level * 12}px` }} />
-            ))}
-          </span>
-        ) : (
-          <span className="voice-dot" aria-hidden="true" />
-        )}
-        {hasText && (
-          <div className="voice-text" ref={text} data-testid="voice-text">
-            <span className="voice-committed">{committed}</span>
-            <span className="voice-tentative">{tentative}</span>
-          </div>
-        )}
-        {(!hasText || snapshot.status !== "listening") &&
-          (isIdle ? (
-            <div className="voice-idle-row">
-              <div className="voice-status">{t("voice.listening")}</div>
-              <div className="voice-hint">{t("voice.sendHint")}</div>
+    <div ref={stage} className="voice-stage">
+      {bubble && (
+        <div className="voice-bubble" data-leaving={leaving} aria-live="polite">
+          {bubble.text.length > 0 && (
+            <div className="voice-text" ref={text} data-testid="voice-text">
+              {bubble.text}
             </div>
-          ) : (
-            <div className="voice-status">{status}</div>
-          ))}
-        {recoverable && (
+          )}
+          <div className="voice-status">{bubble.message}</div>
           <div className="voice-recovery">
-            {snapshot.draft && (
+            {bubble.copyable && (
               <button
                 type="button"
                 tabIndex={-1}
@@ -248,8 +214,8 @@ export default function VoiceOverlay({
                 onClick={() => {
                   const requested = identity.current;
                   void invoke("voice_copy_draft", {
-                    generation: snapshot.generation,
-                    phrase: snapshot.phrase,
+                    generation: bubble.generation,
+                    phrase: bubble.phrase,
                   })
                     .then(() => {
                       if (identity.current === requested)
@@ -270,7 +236,7 @@ export default function VoiceOverlay({
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => {
                 void invoke("voice_dismiss", {
-                  generation: snapshot.generation,
+                  generation: bubble.generation,
                 }).catch(() => {});
               }}
             >
@@ -278,8 +244,15 @@ export default function VoiceOverlay({
             </button>
             {copyState !== "idle" && <span>{t(`voice.${copyState}`)}</span>}
           </div>
-        )}
-      </div>
+        </div>
+      )}
+      <div
+        className="voice-drop"
+        data-tone={toneOf(snapshot)}
+        data-status={snapshot.status}
+        role="status"
+        aria-label={status}
+      />
     </div>
   );
 }

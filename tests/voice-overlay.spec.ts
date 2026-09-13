@@ -4,8 +4,6 @@ import type { VoiceSnapshot } from "../src/overlay/VoiceOverlay";
 declare global {
   interface Window {
     __voiceEmit: (snapshot: VoiceSnapshot) => void;
-    __voiceLevels: (levels: unknown) => void;
-    __voiceListenerCount: (event: string) => number;
     __voiceCalls: { command: string; args: Record<string, unknown> }[];
     __voiceDelayCopy: boolean;
     __voiceFinishCopy: () => void;
@@ -83,9 +81,9 @@ async function setup(page: Page, language = "ru") {
             listeners.delete(key),
         },
       });
-      const emitEvent = (event: string, payload: unknown) => {
+      window.__voiceEmit = (payload) => {
         for (const [key, listener] of listeners) {
-          if (listener.event === event)
+          if (listener.event === "voice-session-state")
             callbacks.get(listener.handler)?.({
               event: listener.event,
               id: key,
@@ -93,18 +91,12 @@ async function setup(page: Page, language = "ru") {
             });
         }
       };
-      window.__voiceEmit = (payload) =>
-        emitEvent("voice-session-state", payload);
-      window.__voiceLevels = (payload) => emitEvent("mic-level", payload);
-      window.__voiceListenerCount = (event) =>
-        [...listeners.values()].filter((listener) => listener.event === event)
-          .length;
       localStorage.setItem("theme", "dark");
     },
     { snapshot: initial, language },
   );
   await page.goto("/src/overlay/index.html");
-  await expect(page.locator(".voice-panel")).toHaveAttribute(
+  await expect(page.locator(".voice-drop")).toHaveAttribute(
     "data-status",
     "loading",
   );
@@ -117,51 +109,65 @@ async function emit(page: Page, change: Partial<VoiceSnapshot>) {
   });
 }
 
+/** Every window size the overlay asked the backend for, in order. */
+async function sizes(page: Page) {
+  return page.evaluate(() =>
+    window.__voiceCalls
+      .filter((call) => call.command === "voice_overlay_size")
+      .map((call) => ({ ...call.args })),
+  );
+}
+
+async function lastSize(page: Page) {
+  return (await sizes(page)).at(-1);
+}
+
+const DROPLET_SIZE = { generation: 4, width: 24, height: 32 };
+
 for (const language of ["en", "ru"]) {
-  test(`send hint fits and uncertain delivery keeps explicit recovery in ${language}`, async ({
+  test(`dictation shows only the droplet and uncertain delivery keeps explicit recovery in ${language}`, async ({
     page,
   }) => {
     await setup(page, language);
+    const drop = page.locator(".voice-drop");
+    const bubble = page.locator(".voice-bubble");
     await emit(page, { revision: 2, status: "listening" });
-    await expect(page.locator(".voice-status")).toHaveText(
+    await expect(drop).toHaveAttribute("data-tone", "neutral");
+    await expect(drop).toHaveAttribute(
+      "aria-label",
       language === "ru" ? "Слушаю" : "Listening",
     );
-    await expect(page.locator(".voice-status")).not.toContainText(
-      /Enter|\d+\s*[sс]/,
-    );
-    const hint = page.locator(".voice-hint");
-    await expect(hint).toBeVisible();
-    await expect(hint).toHaveText(
-      language === "ru"
-        ? "Пауза 1 с — вставка и отправка"
-        : "Pause 1s pastes and sends",
-    );
-    const box = await page.locator(".voice-panel").boundingBox();
-    expect(box?.height).toBe(42);
-    expect(box?.width).toBe(380);
-    expect(
-      await page
-        .locator(".voice-status")
-        .evaluate(
-          (el) => el.scrollWidth <= el.clientWidth && el.scrollHeight <= 20,
-        ),
-    ).toBe(true);
-    await page.screenshot({ path: `/tmp/diktor-send-hint-${language}.png` });
     await emit(page, {
       revision: 3,
+      status: "listening",
+      speech_active: true,
+      committed: "Диктор отправляй ",
+      tentative: "дословно",
+    });
+    await expect(drop).toHaveAttribute("data-tone", "speech");
+    await expect(bubble).toHaveCount(0);
+    await expect(page.locator(".voice-stage")).toHaveText("");
+    await expect(page.locator(".voice-levels, .voice-hint")).toHaveCount(0);
+    await emit(page, {
+      revision: 4,
       status: "committing",
       committed: "Диктор отправляй дословно",
     });
-    await expect(page.locator(".voice-status")).toHaveText(
+    await expect(drop).toHaveAttribute("data-tone", "sending");
+    await expect(drop).toHaveAttribute(
+      "aria-label",
       language === "ru" ? "Отправляю…" : "Sending…",
     );
-    await expect(hint).toBeHidden();
+    await expect(bubble).toHaveCount(0);
+    await expect(page.locator(".voice-stage")).toHaveText("");
+    await expect.poll(() => lastSize(page)).toEqual(DROPLET_SIZE);
     await emit(page, {
-      revision: 4,
+      revision: 5,
       status: "error",
       error: "delivery_uncertain",
       draft: "Диктор отправляй дословно",
     });
+    await expect(drop).toHaveAttribute("data-tone", "error");
     await expect(page.locator(".voice-status")).toHaveText(
       language === "ru"
         ? "Текст мог быть вставлен или отправлен. Проверьте окно; черновик сохранён."
@@ -175,18 +181,14 @@ for (const language of ["en", "ru"]) {
     });
     await expect(copy).toBeVisible();
     expect(
-      await page
-        .locator(".voice-panel")
-        .evaluate((el) => el.scrollHeight <= el.clientHeight),
+      await bubble.evaluate((el) => el.scrollHeight <= el.clientHeight),
     ).toBe(true);
+    await expect.poll(async () => (await lastSize(page))?.width).toBe(350);
     expect(
       await page.evaluate(() =>
         window.__voiceCalls.some((call) => call.command === "voice_copy_draft"),
       ),
     ).toBe(false);
-    await page.screenshot({
-      path: `/tmp/diktor-send-uncertain-${language}.png`,
-    });
     await copy.click();
     await expect(page.locator(".voice-recovery")).toContainText(
       language === "ru" ? "Скопировано" : "Copied",
@@ -230,9 +232,6 @@ for (const language of ["en", "ru"]) {
         name: language === "ru" ? "Скопировать черновик" : "Copy draft",
       }),
     ).toHaveCount(0);
-    await page.screenshot({
-      path: `/tmp/diktor-oom-overlay-startup-${language}.png`,
-    });
     for (const error of [
       "out_of_memory",
       "unsupported_model",
@@ -261,12 +260,8 @@ for (const language of ["en", "ru"]) {
           name: language === "ru" ? "Скопировать черновик" : "Copy draft",
         }),
       ).toBeVisible();
-      const box = await page.locator(".voice-panel").boundingBox();
+      const box = await page.locator(".voice-bubble").boundingBox();
       expect(box?.height).toBeLessThanOrEqual(140);
-      if (error === "out_of_memory")
-        await page.screenshot({
-          path: `/tmp/diktor-oom-overlay-${language}.png`,
-        });
     }
     expect(
       await page.evaluate(() =>
@@ -276,59 +271,99 @@ for (const language of ["en", "ru"]) {
   });
 }
 
-test("loading, immediate speech activity and exact live whitespace", async ({
+test("loading, speech and live text show only the droplet; a draft keeps exact whitespace", async ({
   page,
 }) => {
   await setup(page);
-  await expect(page.locator(".voice-panel")).toHaveText("Подключаю…");
+  const drop = page.locator(".voice-drop");
+  const bubble = page.locator(".voice-bubble");
+  await expect(drop).toHaveAttribute("data-tone", "neutral");
+  await expect(drop).toHaveAttribute("aria-label", "Подключаю…");
+  await expect(bubble).toHaveCount(0);
   await emit(page, { revision: 2, status: "listening", speech_active: true });
-  await expect(page.locator(".voice-panel")).toHaveText("Слышу речь…");
+  await expect(drop).toHaveAttribute("data-tone", "speech");
+  await expect(drop).toHaveAttribute("aria-label", "Слышу речь…");
+  await expect(bubble).toHaveCount(0);
   await emit(page, {
     revision: 3,
     status: "listening",
     committed: "Первая  часть ",
     tentative: "и продолжение",
   });
+  await expect(drop).toHaveAttribute("data-tone", "neutral");
+  await expect(bubble).toHaveCount(0);
+  await expect(page.locator(".voice-stage")).toHaveText("");
+  await expect.poll(() => lastSize(page)).toEqual(DROPLET_SIZE);
+  await emit(page, {
+    revision: 4,
+    status: "draft",
+    error: "target_changed",
+    draft: "Первая  часть и продолжение",
+  });
   expect(await page.getByTestId("voice-text").textContent()).toBe(
     "Первая  часть и продолжение",
   );
   expect(
     await page
-      .locator(".voice-committed")
+      .getByTestId("voice-text")
       .evaluate((el) => getComputedStyle(el).fontSize),
   ).toBe("14px");
-  const box = await page.locator(".voice-panel").boundingBox();
-  expect(box?.width).toBe(380);
-  expect(box?.height).toBe(42);
-  await page.screenshot({ path: "/tmp/diktor-voice-listening.png" });
+  const box = await bubble.boundingBox();
+  expect(box?.width).toBe(320);
+  expect(box?.height).toBeLessThanOrEqual(140);
 });
 
-test("stale generation, phrase and revision cannot revive text or a stopped mode", async ({
+test("stale generation, phrase and revision cannot revive a draft, the tone or a stopped mode", async ({
   page,
 }) => {
   await setup(page);
+  const drop = page.locator(".voice-drop");
   await emit(page, {
     revision: 10,
     phrase: 2,
-    status: "listening",
-    committed: "Новая фраза",
+    status: "draft",
+    error: "target_changed",
+    draft: "Новая фраза",
   });
   for (const stale of [
     { generation: 3, revision: 100, phrase: 3 },
     { phrase: 1, revision: 11 },
     { phrase: 2, revision: 9 },
   ]) {
-    await emit(page, { status: "listening", committed: "Старое", ...stale });
+    await emit(page, {
+      status: "draft",
+      error: "target_changed",
+      draft: "Старое",
+      ...stale,
+    });
+    await emit(page, { status: "listening", speech_active: true, ...stale });
   }
   await expect(page.getByTestId("voice-text")).toHaveText("Новая фраза");
-  await emit(page, { revision: 11, phrase: 2, status: "off" });
+  await expect(drop).toHaveAttribute("data-tone", "error");
+  await emit(page, {
+    revision: 11,
+    phrase: 2,
+    status: "listening",
+    speech_active: true,
+  });
+  await expect(drop).toHaveAttribute("data-tone", "speech");
+  await emit(page, {
+    revision: 11,
+    phrase: 2,
+    status: "error",
+    error: "backlog",
+    draft: "Старое",
+  });
+  await expect(drop).toHaveAttribute("data-tone", "speech");
+  await emit(page, { revision: 12, phrase: 2, status: "off" });
   await emit(page, {
     revision: 10,
     phrase: 2,
-    status: "listening",
-    committed: "Поздний ответ",
+    status: "draft",
+    error: "target_changed",
+    draft: "Поздний ответ",
   });
-  await expect(page.locator(".voice-panel")).toBeHidden();
+  await expect(page.locator(".voice-stage")).toBeHidden();
 });
 
 test("long draft stays compact, scrolls to latest and only explicit Copy invokes clipboard", async ({
@@ -343,7 +378,7 @@ test("long draft stays compact, scrolls to latest and only explicit Copy invokes
     draft,
   });
   await expect(page.getByTestId("voice-text")).toHaveText(draft);
-  const box = await page.locator(".voice-panel").boundingBox();
+  const box = await page.locator(".voice-bubble").boundingBox();
   expect(box?.height).toBeLessThanOrEqual(140);
   expect(
     await page.getByTestId("voice-text").evaluate((el) => el.scrollTop > 0),
@@ -364,7 +399,7 @@ test("long draft stays compact, scrolls to latest and only explicit Copy invokes
   ]);
 });
 
-test("commit and fault preserve readable draft and report bounded native height", async ({
+test("commit stays droplet-sized and a fault grows the window to a bounded bubble", async ({
   page,
 }) => {
   await setup(page);
@@ -373,7 +408,14 @@ test("commit and fault preserve readable draft and report bounded native height"
     status: "committing",
     committed: "Фраза перед вставкой",
   });
-  await expect(page.locator(".voice-status")).toHaveText("Отправляю…");
+  await expect(page.locator(".voice-drop")).toHaveAttribute(
+    "data-tone",
+    "sending",
+  );
+  await expect(page.locator(".voice-bubble")).toHaveCount(0);
+  await expect.poll(() => lastSize(page)).toEqual(DROPLET_SIZE);
+  const beforeFault = await sizes(page);
+  expect(beforeFault.every((size) => size.width === 24)).toBe(true);
   await emit(page, {
     revision: 3,
     status: "error",
@@ -382,24 +424,14 @@ test("commit and fault preserve readable draft and report bounded native height"
   });
   await expect(page.getByTestId("voice-text")).toHaveText("Сохранённый текст");
   await expect(page.locator(".voice-status")).toContainText("Режим остановлен");
-  await expect
-    .poll(
-      async () =>
-        (
-          await page.evaluate(() =>
-            window.__voiceCalls.filter(
-              (call) => call.command === "voice_overlay_height",
-            ),
-          )
-        ).length,
-    )
-    .toBeGreaterThan(0);
-  const heights = await page.evaluate(() =>
-    window.__voiceCalls
-      .filter((call) => call.command === "voice_overlay_height")
-      .map((call) => Number(call.args.height)),
-  );
-  expect(heights.every((height) => height >= 42 && height <= 140)).toBe(true);
+  await expect.poll(async () => (await lastSize(page))?.width).toBe(350);
+  expect(
+    (await sizes(page)).every(
+      ({ width, height }) =>
+        (width === 24 && height === 32) ||
+        (width === 350 && Number(height) >= 32 && Number(height) <= 140),
+    ),
+  ).toBe(true);
 });
 
 test("late Copy completion cannot label a new generation copied", async ({
@@ -430,133 +462,137 @@ test("late Copy completion cannot label a new generation copied", async ({
   );
 });
 
-async function barHeights(page: Page) {
-  return page
-    .locator(".voice-levels > span")
-    .evaluateAll((bars) =>
-      bars.map((bar) => Number.parseFloat((bar as HTMLElement).style.height)),
-    );
+/** Droplet box measured from the viewport's right and bottom edges. */
+async function dropletFromCorner(page: Page) {
+  return page.locator(".voice-drop").evaluate((el) => {
+    const box = el.getBoundingClientRect();
+    return {
+      right: window.innerWidth - box.right,
+      bottom: window.innerHeight - box.bottom,
+      width: box.width,
+      height: box.height,
+    };
+  });
 }
 
-test("five bars follow real buckets, clamp invalid values and expire without events", async ({
+test("droplet stays pixel-stable while the window is resized for the failure bubble", async ({
   page,
 }) => {
   await setup(page);
-  await page.clock.install();
-  await emit(page, { revision: 2, status: "listening" });
-  await expect(page.locator(".voice-levels")).toHaveAttribute(
-    "aria-hidden",
-    "true",
-  );
-  expect(await barHeights(page)).toEqual([2, 2, 2, 2, 2]);
-  for (const [level, height] of [
-    [0.1, 3.2],
-    [1, 14],
-    [0, 2],
-  ]) {
+  const drop = page.locator(".voice-drop");
+  const bubble = page.locator(".voice-bubble");
+  const draft = "Длинная фраза с сохранёнными пробелами. ".repeat(6);
+  const states = [
+    { change: { status: "loading" }, tone: "neutral", failure: false },
+    { change: { status: "listening" }, tone: "neutral", failure: false },
+    {
+      change: { status: "listening", speech_active: true },
+      tone: "speech",
+      failure: false,
+    },
+    {
+      change: {
+        status: "listening",
+        speech_active: true,
+        committed: "Капля стоит на месте ",
+        tentative: "и текста рядом нет",
+      },
+      tone: "speech",
+      failure: false,
+    },
+    {
+      change: { status: "committing", committed: "Капля стоит на месте" },
+      tone: "sending",
+      failure: false,
+    },
+    {
+      change: { status: "error", error: "target_changed", draft },
+      tone: "error",
+      failure: true,
+    },
+    {
+      change: { status: "draft", error: "desktop", draft: "Короткий" },
+      tone: "error",
+      failure: true,
+    },
+    { change: { status: "stopping" }, tone: "neutral", failure: false },
+    { change: { status: "listening" }, tone: "neutral", failure: false },
+  ] as const;
+  let expected: Awaited<ReturnType<typeof dropletFromCorner>> | undefined;
+  for (const [i, { change, tone, failure }] of states.entries()) {
+    await emit(page, { revision: 2 + i, ...change });
+    await expect(drop).toHaveAttribute("data-tone", tone);
+    await expect(drop).toHaveAttribute("data-status", change.status);
+    await expect(bubble).toHaveCount(failure ? 1 : 0);
+    // Emulate the native window: the viewport becomes the size requested.
+    const stage = await page
+      .locator(".voice-stage")
+      .evaluate((el) => el.getBoundingClientRect().toJSON());
+    const size = { generation: 4, width: stage.width, height: stage.height };
+    await expect.poll(() => lastSize(page)).toEqual(size);
+    if (failure) expect(size.width).toBe(350);
+    else expect(size).toEqual(DROPLET_SIZE);
+    await page.setViewportSize({
+      width: Math.ceil(size.width),
+      height: Math.ceil(size.height),
+    });
+    const corner = await dropletFromCorner(page);
+    expect(corner).toEqual({ right: 0, bottom: 0, width: 24, height: 32 });
+    expected ??= corner;
+    expect(corner).toEqual(expected);
+    if (failure) {
+      const box = await bubble.evaluate((el) =>
+        el.getBoundingClientRect().toJSON(),
+      );
+      expect(box.left).toBe(0);
+      expect(box.right).toBe(320);
+      expect(box.bottom).toBe(Math.ceil(size.height));
+    }
+    // The resized window must not change the requested size (no resize loop).
     await page.evaluate(
-      (level) => window.__voiceLevels(Array(16).fill(level)),
-      level,
+      () => new Promise((resolve) => requestAnimationFrame(resolve)),
     );
-    await page.clock.runFor(34);
-    expect(await barHeights(page)).toEqual(Array(5).fill(height));
+    expect(await lastSize(page)).toEqual(size);
   }
-  await page.evaluate(() =>
-    window.__voiceLevels([
-      0, 0, 0, 0.25, 0.25, 0.25, 0.5, 0.5, 0.5, 0.75, 0.75, 0.75, 1, 1, 1, 1,
-    ]),
-  );
-  await page.clock.runFor(34);
-  expect(await barHeights(page)).toEqual([2, 5, 8, 11, 14]);
-  await page.evaluate(() =>
-    window.__voiceLevels([
-      NaN,
-      Infinity,
-      -Infinity,
-      -1,
-      -2,
-      -3,
-      2,
-      3,
-      4,
-      null,
-      "1",
-      undefined,
-      0.5,
-      0.5,
-      0.5,
-      0.5,
-    ]),
-  );
-  await page.clock.runFor(34);
-  expect(await barHeights(page)).toEqual([2, 2, 14, 2, 8]);
-  await page.evaluate(() => window.__voiceLevels({}));
-  await page.clock.runFor(34);
-  expect(await barHeights(page)).toEqual([2, 2, 2, 2, 2]);
-  await page.evaluate(() => window.__voiceLevels(Array(16).fill(1)));
-  await page.clock.runFor(34);
-  await page.clock.runFor(200);
-  expect(await barHeights(page)).toEqual([14, 14, 14, 14, 14]);
-  await page.clock.runFor(20);
-  expect(await barHeights(page)).toEqual([2, 2, 2, 2, 2]);
 });
 
-test("level redraw is bounded and generation/status changes clean pending telemetry", async ({
+test("failure bubble fades out with its last draft before the window shrinks", async ({
   page,
 }) => {
-  await setup(page);
-  const baseListeners = await page.evaluate(() =>
-    window.__voiceListenerCount("mic-level"),
-  );
+  // Install before load: a real timer armed at mount cannot be cleared by the
+  // fake clearTimeout and would end the fade before the test observes it.
   await page.clock.install();
-  await emit(page, { revision: 2, status: "listening" });
-  await expect
-    .poll(() => page.evaluate(() => window.__voiceListenerCount("mic-level")))
-    .toBe(baseListeners + 1);
-  await page.evaluate(() => window.__voiceLevels(Array(16).fill(0.5)));
-  expect(await barHeights(page)).toEqual([8, 8, 8, 8, 8]);
-  for (let i = 0; i < 10; i++) {
-    await page.evaluate(() => window.__voiceLevels(Array(16).fill(1)));
-    await page.clock.runFor(1);
-  }
-  expect(await barHeights(page)).toEqual([8, 8, 8, 8, 8]);
-  await page.clock.runFor(24);
-  expect(await barHeights(page)).toEqual([14, 14, 14, 14, 14]);
-  await page.evaluate(() => window.__voiceLevels(Array(16).fill(0.5)));
-  await emit(page, { generation: 5, revision: 1, status: "listening" });
-  await page.clock.runFor(40);
-  expect(await barHeights(page)).toEqual([2, 2, 2, 2, 2]);
-  await expect
-    .poll(() => page.evaluate(() => window.__voiceListenerCount("mic-level")))
-    .toBe(baseListeners + 1);
-  for (const [i, status] of (
-    ["committing", "draft", "error", "off"] as const
-  ).entries()) {
-    await page.evaluate(() => {
-      window.__voiceLevels(Array(16).fill(1));
-      window.__voiceLevels(Array(16).fill(0.5));
-    });
-    await emit(page, { generation: 5, revision: 2 + i * 2, status });
-    await expect(page.locator(".voice-levels")).toHaveCount(0);
-    await expect
-      .poll(() => page.evaluate(() => window.__voiceListenerCount("mic-level")))
-      .toBe(baseListeners);
-    await emit(page, {
-      generation: 5,
-      revision: 3 + i * 2,
-      status: "listening",
-    });
-    await page.clock.runFor(300);
-    expect(await barHeights(page)).toEqual([2, 2, 2, 2, 2]);
-  }
+  await setup(page);
+  await emit(page, {
+    revision: 2,
+    status: "draft",
+    error: "target_changed",
+    draft: "Уходящий текст",
+  });
+  const bubble = page.locator(".voice-bubble");
+  await expect(bubble).toHaveAttribute("data-leaving", "false");
+  await expect.poll(async () => (await lastSize(page))?.width).toBe(350);
+  expect(
+    await bubble.evaluate((el) => getComputedStyle(el).animationName),
+  ).toBe("voice-fade-in");
+  await emit(page, { revision: 3, status: "listening" });
+  await expect(bubble).toHaveAttribute("data-leaving", "true");
+  await expect(page.getByTestId("voice-text")).toHaveText("Уходящий текст");
+  expect(
+    await bubble.evaluate((el) => getComputedStyle(el).transitionProperty),
+  ).toBe("opacity");
+  expect((await lastSize(page))?.width).toBe(350);
+  await page.clock.runFor(150);
+  await expect(bubble).toHaveCount(0);
+  await expect.poll(() => lastSize(page)).toEqual(DROPLET_SIZE);
 });
 
-/** No countdown strip, nor any other element pinned to the panel's bottom edge. */
+/** No countdown strip, nor any other element pinned to the stage's bottom edge. */
 async function expectNoStrip(page: Page) {
   await expect(page.locator(".voice-silence, [data-kind]")).toHaveCount(0);
   expect(
-    await page.locator(".voice-panel").evaluate((panel) =>
-      [...panel.querySelectorAll("*")].some((el) => {
+    await page.locator(".voice-stage").evaluate((stage) =>
+      [...stage.querySelectorAll("*")].some((el) => {
         const style = getComputedStyle(el);
         return style.position === "absolute" && style.bottom === "0px";
       }),
@@ -564,23 +600,18 @@ async function expectNoStrip(page: Page) {
   ).toBe(false);
 }
 
-test("paste countdown draws no strip and telemetry preserves text scroll", async ({
+test("paste countdown draws no strip and snapshots preserve draft scroll", async ({
   page,
 }) => {
   await setup(page);
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.clock.install();
   const committed = "Длинная фраза с сохранёнными пробелами. ".repeat(25);
-  await emit(page, { revision: 2, status: "listening", committed });
-  const text = page.getByTestId("voice-text");
-  await text.evaluate((el) => {
-    el.scrollTop = 0;
-  });
   for (const [revision, remaining] of [
-    [3, 1000],
-    [4, 500],
-    [5, 1],
-    [6, 0],
+    [2, 1000],
+    [3, 500],
+    [4, 1],
+    [5, 0],
   ]) {
     await emit(page, {
       revision,
@@ -589,22 +620,47 @@ test("paste countdown draws no strip and telemetry preserves text scroll", async
       silence_remaining_ms: remaining,
     });
     await expectNoStrip(page);
+    await expect(page.locator(".voice-bubble")).toHaveCount(0);
     await page.clock.runFor(1500);
     await expectNoStrip(page);
+  }
+  await emit(page, {
+    revision: 6,
+    status: "draft",
+    error: "target_changed",
+    draft: committed,
+  });
+  const text = page.getByTestId("voice-text");
+  await text.evaluate((el) => {
+    el.scrollTop = 0;
+  });
+  for (const [revision, remaining] of [
+    [7, 1000],
+    [8, 0],
+  ]) {
+    await emit(page, {
+      revision,
+      status: "draft",
+      error: "target_changed",
+      draft: committed,
+      silence_remaining_ms: remaining,
+      send_remaining_ms: remaining,
+    });
+    await expectNoStrip(page);
+    await page.clock.runFor(1500);
     expect(await text.evaluate((el) => el.scrollTop)).toBe(0);
     await expect(text).toHaveText(committed);
   }
   await emit(page, { generation: 5, revision: 1, status: "listening" });
   await expectNoStrip(page);
-  expect(await page.locator(".voice-panel").boundingBox()).toMatchObject({
-    width: 380,
-    height: 42,
+  await expect(page.locator(".voice-bubble")).toHaveCount(0);
+  expect(await page.locator(".voice-drop").boundingBox()).toMatchObject({
+    width: 24,
+    height: 32,
   });
 });
 
-test("send countdown to Enter draws no strip and keeps the hint", async ({
-  page,
-}) => {
+test("send countdown to Enter draws no strip and no hint", async ({ page }) => {
   await setup(page, "en");
   await emit(page, { revision: 2, status: "listening" });
   await expectNoStrip(page);
@@ -621,9 +677,7 @@ test("send countdown to Enter draws no strip and keeps the hint", async ({
     status: "listening",
     send_remaining_ms: 3000,
   });
-  await expect(page.locator(".voice-hint")).toHaveText(
-    "Pause 1s pastes and sends",
-  );
+  await expect(page.locator(".voice-hint")).toHaveCount(0);
   await emit(page, {
     revision: 7,
     status: "listening",
@@ -640,49 +694,52 @@ test("send countdown to Enter draws no strip and keeps the hint", async ({
   await expectNoStrip(page);
 });
 
-for (const theme of ["light", "dark"]) {
-  test(`synthetic waveform and strip-free silence screenshots on ${theme}`, async ({
-    page,
-  }) => {
-    await setup(page);
-    await page.setViewportSize({ width: 460, height: 180 });
-    await page.evaluate((theme) => {
-      document.documentElement.dataset.theme = theme;
-      document.body.style.background =
-        theme === "light" ? "#edf0f2" : "#191b1f";
-    }, theme);
-    await page.clock.install();
-    await emit(page, { revision: 2, status: "listening" });
-    await page.screenshot({ path: `/tmp/diktor-wave-${theme}-listening.png` });
-    await emit(page, { revision: 3, status: "listening", speech_active: true });
-    await page.evaluate(() =>
-      window.__voiceLevels([
-        0.1, 0.2, 0.3, 0.5, 0.6, 0.4, 0.8, 0.9, 0.7, 0.6, 0.5, 0.7, 0.2, 0.3,
-        0.4, 0.3,
-      ]),
-    );
-    await page.clock.runFor(34);
-    await page.screenshot({ path: `/tmp/diktor-wave-${theme}-speaking.png` });
-    await emit(page, {
-      revision: 4,
-      status: "listening",
-      committed: "Мини-волна отражает реальный звук",
-      silence_remaining_ms: 500,
-    });
-    await page.evaluate(() => window.__voiceLevels(Array(16).fill(0)));
-    await page.clock.runFor(34);
-    await expectNoStrip(page);
-    await page.screenshot({
-      path: `/tmp/diktor-wave-${theme}-half-silence.png`,
-    });
-    await emit(page, {
-      revision: 5,
-      status: "draft",
-      error: "target_changed",
-      draft: "Мини-волна отражает реальный звук",
-    });
-    await expect(page.locator(".voice-levels")).toHaveCount(0);
-    await expectNoStrip(page);
-    await page.screenshot({ path: `/tmp/diktor-wave-${theme}-draft.png` });
+test("droplet tone screenshots on a dark desktop", async ({ page }) => {
+  await setup(page);
+  await page.setViewportSize({ width: 460, height: 180 });
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.evaluate(() => {
+    document.documentElement.dataset.theme = "dark";
+    document.body.style.background = "#191b1f";
   });
-}
+  const drop = page.locator(".voice-drop");
+  const dot = () =>
+    drop.evaluate((el) => getComputedStyle(el, "::before").backgroundColor);
+  const colours = new Set<string>();
+  await emit(page, { revision: 2, status: "listening" });
+  await expect(page.locator(".voice-bubble")).toHaveCount(0);
+  colours.add(await dot());
+  await page.screenshot({ path: "/tmp/diktor-drop-idle.png" });
+  await emit(page, {
+    revision: 3,
+    status: "listening",
+    speech_active: true,
+    committed: "Капля осталась на месте, ",
+    tentative: "а текст рядом не показывается",
+  });
+  await expect(drop).toHaveAttribute("data-tone", "speech");
+  await expect(page.locator(".voice-bubble")).toHaveCount(0);
+  expect(
+    await drop.evaluate((el) => getComputedStyle(el, "::before").animationName),
+  ).toBe("none");
+  colours.add(await dot());
+  await page.screenshot({ path: "/tmp/diktor-drop-speech.png" });
+  await emit(page, {
+    revision: 4,
+    status: "committing",
+    committed: "Капля осталась на месте",
+  });
+  await expect(drop).toHaveAttribute("data-tone", "sending");
+  colours.add(await dot());
+  await emit(page, {
+    revision: 5,
+    status: "draft",
+    error: "target_changed",
+    draft: "Капля осталась на месте",
+  });
+  await expect(drop).toHaveAttribute("data-tone", "error");
+  await expect(page.locator(".voice-bubble")).toBeVisible();
+  colours.add(await dot());
+  await page.screenshot({ path: "/tmp/diktor-drop-error.png" });
+  expect(colours.size).toBe(4);
+});
