@@ -153,11 +153,17 @@ class TmuxRoute:
         return out.decode(errors="replace") if capture else None
 
     def resolve(self, target, deadline):
-        """(pane, None) or (None, reason to fall back to ydotool)."""
+        """(pane, None) or (None, reason to fall back to ydotool); needs focus-events on."""
         if "ghostty" not in str(target.get("app_id", "")).lower():
             return None, "not_ghostty"
         if shutil.which("tmux") is None:
             return None, "no_tmux"
+        try:
+            focus_events = self.run(deadline, "show-options", "-gv", "focus-events", capture=True)
+        except (OSError, subprocess.CalledProcessError):
+            return None, "no_tmux_server"
+        if focus_events.strip() != "on":
+            return None, "focus_events_off"
         try:
             listing = self.run(deadline, "list-clients", "-F", "#{client_flags}\t#{pane_id}\t#{client_pid}",
                                capture=True)

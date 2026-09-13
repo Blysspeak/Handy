@@ -296,6 +296,7 @@ class FakeTmux:
         self.render_paste = True
         self.on_enter = "submit"
         self.hooks = {}
+        self.focus_events = "on"
 
     def screen(self):
         rows = ["> " + line for line in self.history]
@@ -311,6 +312,9 @@ class FakeTmux:
         hook = self.hooks.pop((op, sum(call[1:2] == [op] for call in self.calls)), None)
         if hook:
             hook()
+        if op == "show-options":
+            assert capture and argv[2:] == ["-gv", "focus-events"]
+            return f"{self.focus_events}\n".encode()
         if op == "list-clients":
             assert capture
             return "".join(f"{flags}\t{pane}\t{pid}\n" for flags, pane, pid in self.clients).encode()
@@ -391,8 +395,8 @@ class TmuxDeliveryTests(unittest.TestCase):
     def test_one_focused_client_pastes_into_its_pane_without_clipboard_or_keys(self):
         result = self.paste()
         self.assertEqual(self.tmux.pasted, [("%3", "Привет мир")])
-        self.assertEqual(self.tmux.ops(), ["list-clients", "list-clients", "capture-pane", "load-buffer",
-                                           "paste-buffer", "capture-pane"])
+        self.assertEqual(self.tmux.ops(), ["show-options", "list-clients", "show-options", "list-clients",
+                                           "capture-pane", "load-buffer", "paste-buffer", "capture-pane"])
         self.assertEqual((self.copies, self.keys, self.tmux.sent), ([], [], []))
         self.assertEqual(result, {"path": "tmux", "pane": "%3", "confirmed": True, "visible_ms": 0})
         self.assertEqual(self.route.last["pane"], "%3")
@@ -425,6 +429,29 @@ class TmuxDeliveryTests(unittest.TestCase):
                 self.assertIn(f"path=ydotool reason={reason}", self.stderr.getvalue())
                 self.assertEqual(self.route.last, {"generation": 3, "pane": None})
 
+    def test_focus_events_off_falls_back_even_with_one_focused_descendant_client(self):
+        self.tmux.clients = [("attached,focused", "%0", 500)]
+        self.tmux.focus_events = "off"
+        self.assertEqual(self.route.resolve(self.target, bridge.Deadline()), (None, "focus_events_off"))
+        result = self.paste()
+        self.assertEqual(result, {"path": "ydotool"})
+        self.assertEqual((self.tmux.pasted, self.copies, self.keys), ([], ["Привет мир"], [["135:1", "135:0"]]))
+        self.assertNotIn("load-buffer", self.tmux.ops())
+        self.assertNotIn("list-clients", self.tmux.ops())
+        self.assertIn("path=ydotool reason=focus_events_off", self.stderr.getvalue())
+
+    def test_focus_events_on_with_one_focused_descendant_client_returns_its_pane(self):
+        self.tmux.clients = [("attached,focused", "%0", 500)]
+        self.assertEqual(self.route.resolve(self.target, bridge.Deadline()), ("%0", None))
+
+    def test_focus_events_off_after_paste_blocks_submit_as_target_changed(self):
+        self.paste()
+        self.tmux.focus_events = "off"
+        with self.assertRaisesRegex(bridge.BridgeError, "target_changed"):
+            self.submit()
+        self.assertEqual((self.tmux.sent, self.keys), ([], []))
+        self.assertIn("pane=None expected=%3 reason=focus_events_off result=target_changed", self.stderr.getvalue())
+
     def test_kwin_mismatch_touches_neither_tmux_nor_clipboard(self):
         self.focus = {**self.target, "id": "window-B"}
         with self.assertRaisesRegex(bridge.BridgeError, "target_changed"):
@@ -436,7 +463,7 @@ class TmuxDeliveryTests(unittest.TestCase):
             self.tmux, "clients", [("attached,focused", "%4", 500)])
         with self.assertRaisesRegex(bridge.BridgeError, "target_changed"):
             self.paste()
-        self.assertEqual(self.tmux.ops(), ["list-clients", "list-clients"])
+        self.assertEqual(self.tmux.ops(), ["show-options", "list-clients", "show-options", "list-clients"])
         self.assertEqual((self.copies, self.keys, self.route.last), ([], [], None))
 
     def test_submit_sends_enter_only_to_remembered_pane_and_confirms_it_cleared(self):
@@ -447,7 +474,7 @@ class TmuxDeliveryTests(unittest.TestCase):
         self.assertEqual(self.tmux.history, ["Привет мир"])
         self.assertEqual(self.keys, [])
         self.assertEqual(result, {"path": "tmux", "pane": "%3", "confirmed": True, "cleared_ms": 0})
-        self.assertEqual(self.tmux.ops(), ["list-clients", "capture-pane", "send-keys", "capture-pane"])
+        self.assertEqual(self.tmux.ops(), ["show-options", "list-clients", "capture-pane", "send-keys", "capture-pane"])
         self.assertIn("op=submit path=tmux pane=%3 confirmed=True cleared_ms=0", self.stderr.getvalue())
 
     def test_pane_change_before_submit_is_target_changed_without_keys(self):
