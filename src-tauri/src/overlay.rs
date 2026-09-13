@@ -1,7 +1,7 @@
 use crate::input;
 use crate::settings;
 use crate::settings::{OverlayPosition, OverlayStyle};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize};
 
@@ -705,21 +705,27 @@ pub fn hide_recording_overlay(app_handle: &AppHandle) {
 static OVERLAY_ENABLED: AtomicBool = AtomicBool::new(false);
 static VOICE_OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static VOICE_LEVELS_QUIET: AtomicBool = AtomicBool::new(false);
+/// Monitor (logical x/y) the voice panel was last actually moved to, so the
+/// cursor-follow timer only touches GTK when the cursor's monitor changes.
+/// i32::MIN means "unset", forcing the first tick after a show to always apply.
+#[cfg(target_os = "linux")]
+static LAST_CURSOR_MONITOR_X: AtomicI32 = AtomicI32::new(i32::MIN);
+#[cfg(target_os = "linux")]
+static LAST_CURSOR_MONITOR_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 
 pub fn voice_overlay_active() -> bool {
     VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire)
 }
 
 /// The mandatory voice panel has no focusable fallback and ignores the classic
-/// overlay preference. KWin output geometry selects the target's monitor.
-pub fn show_voice_overlay(
-    app: &AppHandle,
-    target: &crate::voice_session::state::Target,
-) -> Result<(), String> {
+/// overlay preference. It follows the cursor's monitor live while shown, not
+/// window focus: hovering the other screen (no click needed) is how it is
+/// expected to jump. Window focus stays reserved for KWin-based paste routing
+/// in voice_session, which is unrelated to where this panel is drawn.
+pub fn show_voice_overlay(app: &AppHandle) -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         let app_handle = app.clone();
-        let target = target.clone();
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         app.run_on_main_thread(move || {
             use gtk::prelude::*;
@@ -731,26 +737,33 @@ pub fn show_voice_overlay(
                     .get_webview_window("recording_overlay")
                     .ok_or("desktop")?;
                 let gtk_window = window.gtk_window().map_err(|_| "desktop")?;
-                let display = gtk::gdk::Display::default().ok_or("desktop")?;
-                let monitor = (0..display.n_monitors())
-                    .filter_map(|i| display.monitor(i))
-                    .find(|monitor| {
-                        let geometry = monitor.geometry();
-                        geometry.x() == target.output_x && geometry.y() == target.output_y
-                    })
-                    .ok_or("target_unavailable")?;
-                gtk_window.set_monitor(&monitor);
-                gtk_window.set_keyboard_mode(KeyboardMode::None);
-                gtk_window.set_anchor(Edge::Top, false);
-                gtk_window.set_anchor(Edge::Left, false);
-                gtk_window.set_anchor(Edge::Bottom, true);
-                gtk_window.set_anchor(Edge::Right, true);
-                gtk_window.set_layer_shell_margin(Edge::Bottom, 24);
-                gtk_window.set_layer_shell_margin(Edge::Right, 24);
-                gtk_window.set_layer_shell_margin(Edge::Top, 0);
-                gtk_window.set_size_request(380, 42);
-                gtk_window.resize(1, 1);
-                VOICE_OVERLAY_ACTIVE.store(true, Ordering::Release);
+                apply_cursor_monitor(&app_handle, &gtk_window)?;
+                let was_active = VOICE_OVERLAY_ACTIVE.swap(true, Ordering::AcqRel);
+                if !was_active {
+                    gtk_window.set_size_request(380, 42);
+                    gtk_window.resize(1, 1);
+                    // Cursor-follow for the rest of this voice session: self-stops
+                    // (Break) once VOICE_OVERLAY_ACTIVE goes false, so no explicit
+                    // cancellation is needed from hide_voice_overlay.
+                    let timer_app = app_handle.clone();
+                    gtk::glib::timeout_add_local(
+                        std::time::Duration::from_millis(200),
+                        move || {
+                            if !VOICE_OVERLAY_ACTIVE.load(Ordering::Acquire) {
+                                LAST_CURSOR_MONITOR_X.store(i32::MIN, Ordering::Relaxed);
+                                LAST_CURSOR_MONITOR_Y.store(i32::MIN, Ordering::Relaxed);
+                                return gtk::glib::ControlFlow::Break;
+                            }
+                            if let Some(window) = timer_app.get_webview_window("recording_overlay")
+                            {
+                                if let Ok(gtk_window) = window.gtk_window() {
+                                    let _ = apply_cursor_monitor(&timer_app, &gtk_window);
+                                }
+                            }
+                            gtk::glib::ControlFlow::Continue
+                        },
+                    );
+                }
                 window.show().map_err(|_| "desktop".to_string())
             })();
             let _ = tx.send(result);
@@ -761,8 +774,70 @@ pub fn show_voice_overlay(
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (app, target);
+        let _ = app;
         Err("unsupported_desktop".into())
+    }
+}
+
+/// Moves the layer-shell surface to the cursor's monitor and re-anchors it to
+/// that monitor's outer edge. No-op when the cursor is still on the same
+/// monitor as last time, so the 200ms poll doesn't hit GTK on every tick.
+#[cfg(target_os = "linux")]
+fn apply_cursor_monitor(
+    app_handle: &AppHandle,
+    gtk_window: &gtk::ApplicationWindow,
+) -> Result<(), String> {
+    use gtk::prelude::*;
+
+    let cursor_monitor = get_monitor_with_cursor(app_handle).ok_or("target_unavailable")?;
+    let scale = cursor_monitor.scale_factor();
+    // tauri::Monitor::position() is physical pixels; GDK monitor geometry
+    // below is logical, so scale down before comparing (see calculate_overlay_position).
+    let cursor_x = (cursor_monitor.position().x as f64 / scale).round() as i32;
+    let cursor_y = (cursor_monitor.position().y as f64 / scale).round() as i32;
+    if LAST_CURSOR_MONITOR_X.load(Ordering::Acquire) == cursor_x
+        && LAST_CURSOR_MONITOR_Y.load(Ordering::Acquire) == cursor_y
+    {
+        return Ok(());
+    }
+
+    let display = gtk::gdk::Display::default().ok_or("desktop")?;
+    let monitors: Vec<_> = (0..display.n_monitors())
+        .filter_map(|i| display.monitor(i))
+        .collect();
+    let monitor = monitors
+        .iter()
+        .find(|monitor| {
+            let geometry = monitor.geometry();
+            geometry.x() == cursor_x && geometry.y() == cursor_y
+        })
+        .ok_or("target_unavailable")?;
+    gtk_window.set_monitor(monitor);
+    gtk_window.set_keyboard_mode(KeyboardMode::None);
+    let monitor_xs: Vec<i32> = monitors.iter().map(|m| m.geometry().x()).collect();
+    let hug_left = anchor_left(cursor_x, &monitor_xs);
+    gtk_window.set_anchor(Edge::Top, false);
+    gtk_window.set_anchor(Edge::Left, hug_left);
+    gtk_window.set_anchor(Edge::Bottom, true);
+    gtk_window.set_anchor(Edge::Right, !hug_left);
+    gtk_window.set_layer_shell_margin(Edge::Bottom, 24);
+    gtk_window.set_layer_shell_margin(Edge::Left, if hug_left { 24 } else { 0 });
+    gtk_window.set_layer_shell_margin(Edge::Right, if hug_left { 0 } else { 24 });
+    gtk_window.set_layer_shell_margin(Edge::Top, 0);
+    LAST_CURSOR_MONITOR_X.store(cursor_x, Ordering::Release);
+    LAST_CURSOR_MONITOR_Y.store(cursor_y, Ordering::Release);
+    Ok(())
+}
+
+/// True when `target_x` is the strict leftmost of the connected monitors and
+/// at least one other monitor sits at a different x — a real side-by-side
+/// layout where the panel should hug the left edge instead of the default
+/// right edge that fits a single monitor or the rightmost of several.
+#[cfg(target_os = "linux")]
+fn anchor_left(target_x: i32, monitor_xs: &[i32]) -> bool {
+    match monitor_xs.iter().copied().min() {
+        Some(min_x) => target_x == min_x && monitor_xs.iter().any(|&x| x != target_x),
+        None => false,
     }
 }
 
@@ -892,6 +967,14 @@ mod tests {
         assert!(is_mouse_within_monitor((-1, 1239), &position, &size));
         assert!(!is_mouse_within_monitor((0, 0), &position, &size));
         assert!(!is_mouse_within_monitor((-1, 1240), &position, &size));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn voice_overlay_hugs_left_only_as_the_leftmost_of_several_monitors() {
+        assert!(!anchor_left(0, &[0]));
+        assert!(anchor_left(0, &[0, 2560]));
+        assert!(!anchor_left(2560, &[0, 2560]));
     }
 
     #[cfg(target_os = "windows")]

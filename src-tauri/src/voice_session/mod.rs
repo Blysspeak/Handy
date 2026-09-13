@@ -106,14 +106,12 @@ impl VoiceSessionManager {
                 return Err("busy".into());
             }
             let bridge = bridge.as_ref().ok_or("desktop")?;
-            let target = bridge.target()?;
-            crate::overlay::show_voice_overlay(&self.app, &target)?;
+            crate::overlay::show_voice_overlay(&self.app)?;
             self.publish(&queue);
-            let target = bridge.enable(generation)?;
+            bridge.enable(generation)?;
             if !queue.active() {
                 return Ok(());
             }
-            crate::overlay::show_voice_overlay(&self.app, &target)?;
             self.publish(&queue);
             let ready = self
                 .transcription
