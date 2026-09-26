@@ -9,6 +9,7 @@
     "dismiss": "Close voice mode",
     "copied": "Copied",
     "copyFailed": "Could not copy",
+    "barCopyHint": "Right-click the icon to copy the draft.",
     "errors": {
       "target_changed": "Return to the selected window, or copy the draft.",
       "target_unavailable": "The selected window is unavailable. You can copy the draft.",

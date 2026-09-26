@@ -1,3 +1,4 @@
+mod bar_state;
 mod desktop;
 pub mod state;
 
@@ -5,10 +6,11 @@ use crate::managers::{
     audio::AudioRecordingManager,
     transcription::{voice_error_code, TranscriptionManager},
 };
+use bar_state::BarState;
 use desktop::DesktopBridge;
 use state::{lock, BoundaryMarker, Snapshot, Status, VoiceQueue, COMMIT_TIMEOUT};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -25,6 +27,9 @@ pub struct VoiceSessionManager {
     session: Mutex<Option<Arc<VoiceQueue>>>,
     generation: AtomicU64,
     busy: AtomicBool,
+    /// Set on Hyprland only: state goes to the Omarchy bar instead of the
+    /// floating panel. Unset (KDE) leaves the panel exactly as it was.
+    bar: OnceLock<BarState>,
 }
 
 impl VoiceSessionManager {
@@ -41,6 +46,7 @@ impl VoiceSessionManager {
             session: Mutex::new(None),
             generation: AtomicU64::new(0),
             busy: AtomicBool::new(false),
+            bar: OnceLock::new(),
         })
     }
 
@@ -63,6 +69,12 @@ impl VoiceSessionManager {
                 }
             }) {
                 Ok(bridge) => {
+                    if bridge.bar_indicator() {
+                        if let Some(bar) = BarState::new() {
+                            bar.show(None, String::new);
+                            let _ = manager.bar.set(bar);
+                        }
+                    }
                     *lock(&manager.desktop) = Some(bridge);
                     log::info!("Persistent voice keyboard ready; mode off (Ctrl+Super+D)");
                     if start {
@@ -106,7 +118,9 @@ impl VoiceSessionManager {
                 return Err("busy".into());
             }
             let bridge = bridge.as_ref().ok_or("desktop")?;
-            crate::overlay::show_voice_overlay(&self.app)?;
+            if self.bar.get().is_none() {
+                crate::overlay::show_voice_overlay(&self.app)?;
+            }
             self.publish(&queue);
             bridge.enable(generation)?;
             if !queue.active() {
@@ -243,6 +257,11 @@ impl VoiceSessionManager {
     fn publish(&self, queue: &VoiceQueue) {
         let snapshot = queue.snapshot();
         let _ = self.app.emit("voice-session-state", &snapshot);
+        if let Some(bar) = self.bar.get() {
+            bar.show(Some(&snapshot), || {
+                crate::settings::get_settings(&self.app).app_language
+            });
+        }
         if snapshot.status == Status::Off {
             crate::overlay::hide_voice_overlay(&self.app);
         }

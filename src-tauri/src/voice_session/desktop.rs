@@ -39,9 +39,15 @@ pub struct DesktopBridge {
     /// One helper request at a time, so the reply deadline measures the
     /// helper's work instead of time spent queued behind a paste.
     request_serial: Mutex<()>,
+    desktop: Desktop,
 }
 
 impl DesktopBridge {
+    /// Hyprland shows voice state in the Omarchy bar, not a floating panel.
+    pub fn bar_indicator(&self) -> bool {
+        self.desktop == Desktop::Hyprland
+    }
+
     pub fn start(
         on_event: impl Fn(String, Option<Target>) + Send + Sync + 'static,
     ) -> Result<Arc<Self>, String> {
@@ -91,6 +97,7 @@ impl DesktopBridge {
             directory,
             generation_write: Mutex::new(()),
             request_serial: Mutex::new(()),
+            desktop,
         });
         let weak = Arc::downgrade(&bridge);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
