@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(glossary.apply("спроси гпт"), "спроси гпт");
         // A second connection (the CLI) writes; the daemon's glossary sees it.
         let cli = Journal::open(&directory, 30, 1000).unwrap();
-        cli.glossary_add("гпт", "GPT", false, "claude", None)
+        cli.glossary_add("гпт", "GPT", false, "claude", None, true)
             .unwrap();
         assert_eq!(glossary.apply("спроси гпт"), "спроси GPT");
         cli.glossary_remove("хаб", None).unwrap();

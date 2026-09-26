@@ -21,8 +21,19 @@ diktor copy [N]          # в буфер: невставленный текст 
                          # или последние N невставленных фраз
 diktor dismiss           # закрыть попап бара (фразы остаются в базе)
 diktor lang ru|en|auto   # язык распознавания, со следующей фразы; сохраняется в конфиг
+diktor say "text"        # сказать по-английски (Kokoro, голос bm_fable); --slow, --voice, --out FILE
+diktor say --preview     # фраза из 2-3 ваших терминов — послушать, как голос их произносит
+diktor say --list-voices
+diktor tts set --voice am_michael --speed 0.9
+diktor model list        # установленные и каталог потоковых моделей
+diktor model download nemotron-3.5-asr-streaming-0.6b-gguf [--quant Q4_K_M]
+diktor model use <file>  # переключить модель (голосовой режим должен быть выключен)
+diktor panel [open|close|toggle]   # панель Diktor в баре (средний клик по иконке)
 diktor devices           # имена микрофонов для input_device
 ```
+
+Пока `diktor say` говорит, голосовой режим слышит тишину (плюс 300 мс
+хвоста) — свой голос из колонок Diktor не печатает.
 
 Словарь и журнал (работают без демона, у каждой команды есть `--json`):
 
@@ -31,9 +42,12 @@ diktor glossary list                          # что как пишется
 diktor glossary add камит commit              # точное слово
 diktor glossary add --stem "икс хаб" xhub     # имя: падежи и приклеенный предлог
 diktor glossary remove камит
+diktor glossary approve гпт                   # принять предложение Claude (claude_glossary = "suggest")
 diktor misses [--days 30]                     # латиница/КАПС в распознанном, чего нет в словаре
 diktor phrases recent [--limit 20]            # распознано / вставлено / статус
+diktor phrases search камит
 diktor phrases correct <id> "правильный текст"
+diktor copy --id <id>                         # любую фразу из журнала в буфер
 diktor vocab list [--source owner|claude|dir] # термины: ручные + имена каталогов проектов
 diktor vocab add "Claude Code"
 ```

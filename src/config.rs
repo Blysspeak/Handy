@@ -31,6 +31,9 @@ pub struct Config {
     pub vocabulary_dirs: Vec<String>,
     /// Subdirectory names too generic to be terms.
     pub vocabulary_skip: Vec<String>,
+    /// `auto`: Claude's glossary additions apply at once; `suggest`: they wait
+    /// for `diktor glossary approve`.
+    pub claude_glossary: String,
     /// `diktor say`: engine, voice, speed.
     pub tts: crate::tts::TtsConfig,
 }
@@ -48,6 +51,7 @@ impl Default for Config {
             log_level: "info".into(),
             vocabulary_dirs: vec!["~/workSpace/project".into()],
             vocabulary_skip: vec!["src".into(), "archive".into(), "spec-kit".into()],
+            claude_glossary: "auto".into(),
             tts: crate::tts::TtsConfig::default(),
         }
     }
@@ -90,41 +94,79 @@ pub fn valid_language(code: &str) -> bool {
         })
 }
 
-/// Writes `language = "<code>"` into the config file, keeping every other
-/// line; creates the file when missing. Atomic, and only if it still parses.
-pub fn save_language(path: &Path, code: &str) -> anyhow::Result<()> {
+/// Writes `key = value` (in `[section]`, or at the top level) into the config
+/// file, keeping every other line and comment; creates the file when missing.
+/// Atomic, and only if the result still parses as a config.
+pub fn save_value(
+    path: &Path,
+    section: Option<&str>,
+    key: &str,
+    value: toml::Value,
+) -> anyhow::Result<Config> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(anyhow::anyhow!("{}: {error}", path.display())),
     };
-    let line = format!("language = {}", toml::Value::String(code.to_string()));
-    let mut replaced = false;
-    let mut lines: Vec<String> = text
-        .lines()
-        .map(|existing| {
-            let key = existing.split('=').next().unwrap_or("").trim();
-            if !replaced && key == "language" {
-                replaced = true;
-                line.clone()
-            } else {
-                existing.to_string()
+    let line = format!("{key} = {value}");
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let header = |l: &str| l.trim_start().starts_with('[');
+    // The lines of the wanted table: [start, end).
+    let (start, end) = match section {
+        None => (
+            0,
+            lines.iter().position(|l| header(l)).unwrap_or(lines.len()),
+        ),
+        Some(name) => match lines.iter().position(|l| l.trim() == format!("[{name}]")) {
+            Some(at) => {
+                let end = lines[at + 1..]
+                    .iter()
+                    .position(|l| header(l))
+                    .map_or(lines.len(), |n| at + 1 + n);
+                (at + 1, end)
             }
-        })
-        .collect();
-    if !replaced {
-        lines.push(line);
+            None => {
+                lines.push(String::new());
+                lines.push(format!("[{name}]"));
+                (lines.len(), lines.len())
+            }
+        },
+    };
+    let existing = (start..end).find(|&n| lines[n].split('=').next().unwrap_or("").trim() == key);
+    match existing {
+        Some(n) => lines[n] = line,
+        None => {
+            // After the last key of the table, before blank lines/comments of the next.
+            let mut at = end;
+            while at > start
+                && (lines[at - 1].trim().is_empty() || lines[at - 1].trim_start().starts_with('#'))
+            {
+                at -= 1;
+            }
+            lines.insert(at, line);
+        }
     }
     let updated = lines.join("\n") + "\n";
     let config: Config =
         toml::from_str(&updated).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
-    anyhow::ensure!(config.language == code, "language not saved");
     if let Some(directory) = path.parent() {
         std::fs::create_dir_all(directory)?;
     }
     let temporary = path.with_extension("toml.tmp");
     std::fs::write(&temporary, updated)?;
     std::fs::rename(temporary, path)?;
+    Ok(config)
+}
+
+/// `diktor lang`: `language = "<code>"`.
+pub fn save_language(path: &Path, code: &str) -> anyhow::Result<()> {
+    let config = save_value(
+        path,
+        None,
+        "language",
+        toml::Value::String(code.to_string()),
+    )?;
+    anyhow::ensure!(config.language == code, "language not saved");
     Ok(())
 }
 
@@ -267,6 +309,54 @@ mod tests {
         assert_eq!(Config::load(&path).unwrap().language, "auto");
         assert!(valid_language("ru") && valid_language("auto") && valid_language("pt-BR"));
         assert!(!valid_language("RU") && !valid_language("r") && !valid_language("ru;x"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn values_land_in_their_table_and_keep_comments() {
+        let directory =
+            std::env::temp_dir().join(format!("diktor-config-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("config.toml");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            &path,
+            "# top\nlanguage = \"ru\"\n\n# voice\n[tts]\nvoice = \"bm_fable\"\n",
+        )
+        .unwrap();
+        save_value(&path, Some("tts"), "speed", toml::Value::Float(0.8)).unwrap();
+        save_value(
+            &path,
+            Some("tts"),
+            "voice",
+            toml::Value::String("am_michael".into()),
+        )
+        .unwrap();
+        save_value(&path, None, "model", toml::Value::String("x.gguf".into())).unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(
+            (config.tts.voice.as_str(), config.tts.speed),
+            ("am_michael", 0.8)
+        );
+        assert_eq!(
+            (config.model.as_str(), config.language.as_str()),
+            ("x.gguf", "ru")
+        );
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# top\nlanguage = \"ru\"\nmodel = \"x.gguf\"\n\n# voice\n[tts]"));
+        // A missing table is appended.
+        std::fs::write(&path, "language = \"ru\"\n").unwrap();
+        save_value(
+            &path,
+            Some("tts"),
+            "voice",
+            toml::Value::String("af_heart".into()),
+        )
+        .unwrap();
+        assert_eq!(Config::load(&path).unwrap().tts.voice, "af_heart");
+        // Something that does not parse is not written.
+        assert!(save_value(&path, None, "keep_days", toml::Value::String("x".into())).is_err());
+        assert_eq!(Config::load(&path).unwrap().tts.voice, "af_heart");
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -302,6 +302,8 @@ impl Journal {
     }
 
     /// Adds or replaces the entry for `from` of this kind.
+    /// `enabled` false keeps the entry pending (Claude's suggestion).
+    #[allow(clippy::too_many_arguments)]
     pub fn glossary_add(
         &self,
         from: &str,
@@ -309,23 +311,66 @@ impl Journal {
         stem: bool,
         source: &str,
         note: Option<&str>,
+        enabled: bool,
     ) -> rusqlite::Result<()> {
         lock(&self.connection).execute(
-            "INSERT INTO glossary (from_text, to_text, kind, source, note, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO glossary (from_text, to_text, kind, source, note, created_at, enabled)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT (from_text, kind) DO UPDATE SET
                  to_text = excluded.to_text, source = excluded.source,
-                 note = excluded.note, created_at = excluded.created_at, enabled = 1",
+                 note = excluded.note, created_at = excluded.created_at,
+                 enabled = excluded.enabled",
             params![
                 crate::glossary::normalise(from),
                 to,
                 if stem { "stem" } else { "word" },
                 source,
                 note,
-                now_ms()
+                now_ms(),
+                i64::from(enabled)
             ],
         )?;
         Ok(())
+    }
+
+    /// Turns pending entries for `from` on; returns how many.
+    pub fn glossary_approve(&self, from: &str) -> rusqlite::Result<usize> {
+        lock(&self.connection).execute(
+            "UPDATE glossary SET enabled = 1 WHERE from_text = ?1 AND enabled = 0",
+            params![crate::glossary::normalise(from)],
+        )
+    }
+
+    /// Phrases whose recognised, pasted or corrected text contains `query`,
+    /// case-insensitively for Cyrillic too (SQLite's lower() is ASCII only;
+    /// retention keeps the table small enough to filter here).
+    pub fn search(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<PhraseRow>> {
+        let query = query.to_lowercase();
+        let found = self
+            .recent(usize::MAX)?
+            .into_iter()
+            .filter(|row| {
+                [Some(&row.text), Some(&row.raw), row.corrected.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|text| text.to_lowercase().contains(&query))
+            })
+            .take(limit)
+            .collect();
+        Ok(found)
+    }
+
+    /// The text of phrase `id` to copy: the correction when there is one.
+    pub fn phrase_text(&self, id: i64) -> rusqlite::Result<Option<String>> {
+        match lock(&self.connection).query_row(
+            "SELECT COALESCE(corrected_text, text) FROM phrases WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        ) {
+            Ok(text) => Ok(Some(text)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Removes `from` (both kinds unless one is given); returns rows removed.
@@ -761,6 +806,7 @@ mod tests {
                 false,
                 "claude",
                 Some("from chat"),
+                true,
             )
             .unwrap();
         assert!(journal.glossary_version().unwrap() > version);
@@ -803,6 +849,13 @@ mod tests {
             .correct(recent[1].id, "сделай commit и push")
             .unwrap());
         assert!(!journal.correct(9999, "нет такой").unwrap());
+        assert_eq!(journal.search("КАМИТ", 10).unwrap().len(), 1);
+        assert_eq!(journal.search("push", 10).unwrap()[0].id, recent[1].id);
+        assert_eq!(
+            journal.phrase_text(recent[1].id).unwrap().as_deref(),
+            Some("сделай commit и push")
+        );
+        assert_eq!(journal.phrase_text(9999).unwrap(), None);
         assert_eq!(
             journal.recent(10).unwrap()[1].corrected.as_deref(),
             Some("сделай commit и push")

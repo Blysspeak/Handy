@@ -9,6 +9,7 @@ mod engine;
 mod glossary;
 mod ipc;
 mod journal;
+mod models;
 mod tts;
 mod vocabulary;
 mod voice_session;
@@ -49,7 +50,12 @@ enum Command {
     /// Copy text no window received to the clipboard: without N, what the
     /// bar popup shows (else everything not copied yet); with N, the last N
     /// undelivered phrases, copied before or not.
-    Copy { n: Option<usize> },
+    Copy {
+        n: Option<usize>,
+        /// Copy phrase ID (its correction when there is one), any status.
+        #[arg(long, conflicts_with = "n")]
+        id: Option<i64>,
+    },
     /// Close the bar popup; its phrases stay in the journal for `copy`.
     Dismiss,
     /// Recognition language: ru, en, ... or auto (the model detects it per
@@ -95,11 +101,67 @@ enum Command {
         /// List the engine's voices.
         #[arg(long)]
         list_voices: bool,
+        /// Speak a sample sentence made of 2-3 of the owner's terms.
+        #[arg(long, conflicts_with = "text")]
+        preview: bool,
         #[arg(long)]
         json: bool,
     },
+    /// Recognition models: installed, catalog, download, switch.
+    Model {
+        #[command(subcommand)]
+        action: ModelAction,
+    },
+    /// Speech output settings.
+    Tts {
+        #[command(subcommand)]
+        action: TtsAction,
+    },
+    /// Open, close or toggle the Diktor panel of the bar widget.
+    Panel {
+        #[arg(value_parser = ["open", "close", "toggle"], default_value = "toggle")]
+        action: String,
+    },
     /// Input device names accepted by `input_device` in the config.
     Devices,
+}
+
+#[derive(Subcommand)]
+enum ModelAction {
+    /// Installed models and the streaming models of the catalog.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Download a catalog model (id or file name; Q8_0 unless --quant).
+    Download {
+        model: String,
+        #[arg(long)]
+        quant: Option<String>,
+        /// One JSON progress line per update.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Switch to an installed model (file name or path): saved in the config,
+    /// loaded by the running daemon (voice mode must be off).
+    Use {
+        model: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TtsAction {
+    /// Default voice and speed of `diktor say` (saved in [tts]).
+    Set {
+        #[arg(long)]
+        voice: Option<String>,
+        #[arg(long)]
+        speed: Option<f32>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -120,7 +182,10 @@ fn main() -> ExitCode {
         Command::Toggle => send("toggle"),
         Command::Off => send("off"),
         Command::Status => status(),
-        Command::Copy { n } => copy(n),
+        Command::Copy { n, id } => match id {
+            Some(id) => copy_id(id),
+            None => copy(n),
+        },
         Command::Dismiss => dismiss(),
         Command::Lang { language } => lang(&language),
         Command::Glossary { action } => cli_terms::glossary_command(action),
@@ -134,15 +199,20 @@ fn main() -> ExitCode {
             slow,
             out,
             list_voices,
+            preview,
             json,
         } => say(SayArgs {
             text,
+            preview,
             voice,
             speed: if slow { Some(tts::SLOW_SPEED) } else { speed },
             out,
             list_voices,
             json,
         }),
+        Command::Model { action } => model_command(action),
+        Command::Tts { action } => tts_command(action),
+        Command::Panel { action } => panel(&action),
         Command::Devices => devices(),
     };
     match result {
@@ -263,6 +333,13 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
                     route.mute(std::time::Duration::from_millis(cap.min(120_000)));
                     json!({ "ok": true })
                 }
+                model if model.starts_with("model ") => {
+                    let path = PathBuf::from(model.trim_start_matches("model ").trim());
+                    match transcriber.reload(path) {
+                        Ok(()) => json!({ "ok": true }),
+                        Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
+                    }
+                }
                 "unmute" => {
                     route.unmute();
                     json!({ "ok": true })
@@ -272,7 +349,7 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
                     "pid": std::process::id(),
                     "voice": voice(&server_manager),
                     "model": transcriber.model_state(),
-                    "model_path": model_path.display().to_string(),
+                    "model_path": transcriber.model_path().display().to_string(),
                     "language": transcriber.language(),
                     "rss_kb": rss_kb(),
                     "waiting": journal.waiting().map(|w| w.len()).ok(),
@@ -424,6 +501,7 @@ fn lang(code: &str) -> anyhow::Result<ExitCode> {
 
 struct SayArgs {
     text: Vec<String>,
+    preview: bool,
     voice: Option<String>,
     speed: Option<f32>,
     out: Option<PathBuf>,
@@ -451,6 +529,17 @@ fn say(args: SayArgs) -> anyhow::Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let mut text = args.text.join(" ");
+    if args.preview {
+        let journal = Journal::open(&config::data_dir(), config.keep_days, config.keep_phrases)?;
+        let dirs: Vec<_> = config
+            .vocabulary_dirs
+            .iter()
+            .map(|d| vocabulary::expand(d))
+            .collect();
+        let terms = vocabulary::effective(&journal, &dirs, &config.vocabulary_skip)?;
+        text = tts::preview_sentence(&terms, journal::now_ms().unsigned_abs());
+        eprintln!("{text}");
+    }
     if text.trim().is_empty() {
         std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
     }
@@ -483,6 +572,165 @@ fn say(args: SayArgs) -> anyhow::Result<ExitCode> {
     played?;
     let journal = Journal::open(&config::data_dir(), config.keep_days, config.keep_phrases)?;
     journal.tts_spoken(&text, engine.name(), &voice, speed)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+fn copy_id(id: i64) -> anyhow::Result<ExitCode> {
+    let (journal, socket) = open_journal()?;
+    let text = journal
+        .phrase_text(id)?
+        .ok_or_else(|| anyhow::anyhow!("нет фразы #{id}"))?;
+    journal::copy_to_clipboard(&text).map_err(anyhow::Error::msg)?;
+    journal.copied(&[id])?;
+    let _ = ipc::request(&socket, "refresh");
+    println!("скопировано: #{id}");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn model_command(action: ModelAction) -> anyhow::Result<ExitCode> {
+    let path = config::config_path();
+    let config = Config::load(&path)?;
+    match action {
+        ModelAction::List { json } => {
+            let entries = models::list(&config)?;
+            if json {
+                println!("{}", serde_json::to_string(&entries)?);
+                return Ok(ExitCode::SUCCESS);
+            }
+            for entry in entries {
+                let state = if entry.current {
+                    "* "
+                } else if entry.installed {
+                    "+ "
+                } else {
+                    "  "
+                };
+                let progress = entry
+                    .downloading
+                    .map(|bytes| format!("  загрузка {} МБ", bytes / 1_000_000))
+                    .unwrap_or_default();
+                println!(
+                    "{state}{}  {} МБ  {}{progress}",
+                    entry.file,
+                    entry.size_bytes / 1_000_000,
+                    entry.name
+                );
+            }
+        }
+        ModelAction::Download { model, quant, json } => {
+            let target = models::download(&model, quant.as_deref(), |bytes, total| {
+                if json {
+                    println!("{}", json!({ "bytes": bytes, "total": total }));
+                } else {
+                    eprint!("\r{} / {} МБ", bytes / 1_000_000, total / 1_000_000);
+                }
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    json!({ "ok": true, "path": target.display().to_string() })
+                );
+            } else {
+                eprintln!();
+                println!("{}", target.display());
+            }
+        }
+        ModelAction::Use { model, json } => {
+            let entry = models::list(&config)?
+                .into_iter()
+                .find(|e| e.installed && (e.file == model || e.path.as_deref() == Some(&model)))
+                .ok_or_else(|| anyhow::anyhow!("{model}: не установлена (diktor model list)"))?;
+            let file = entry.path.clone().unwrap_or(entry.file.clone());
+            // Reload first: a daemon that refuses (voice mode on) keeps the old config.
+            let reloaded = match ipc::request(&socket()?, &format!("model {file}")) {
+                Ok(reply) if reply["ok"].as_bool() == Some(true) => true,
+                Ok(reply) => anyhow::bail!("{}", reply["error"].as_str().unwrap_or("отказ демона")),
+                Err(_) => false,
+            };
+            config::save_value(
+                &path,
+                None,
+                "model",
+                toml::Value::String(entry.file.clone()),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    json!({ "ok": true, "model": entry.file, "reloading": reloaded })
+                );
+            } else {
+                println!(
+                    "модель: {}{}",
+                    entry.file,
+                    if reloaded {
+                        " (загружается)"
+                    } else {
+                        " (демон не запущен)"
+                    }
+                );
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn tts_command(action: TtsAction) -> anyhow::Result<ExitCode> {
+    let TtsAction::Set { voice, speed, json } = action;
+    let path = config::config_path();
+    let config = Config::load(&path)?;
+    if let Some(voice) = &voice {
+        let engine = tts::engine(&config.tts)?;
+        anyhow::ensure!(
+            engine.voices()?.iter().any(|v| &v.id == voice),
+            "{voice}: нет такого голоса (diktor say --list-voices)"
+        );
+        config::save_value(
+            &path,
+            Some("tts"),
+            "voice",
+            toml::Value::String(voice.clone()),
+        )?;
+    }
+    if let Some(speed) = speed {
+        anyhow::ensure!(
+            (0.25..=4.0).contains(&speed),
+            "speed {speed}: ожидается 0.25..4"
+        );
+        config::save_value(
+            &path,
+            Some("tts"),
+            "speed",
+            toml::Value::Float((f64::from(speed) * 100.0).round() / 100.0),
+        )?;
+    }
+    let config = Config::load(&path)?;
+    if json {
+        println!(
+            "{}",
+            json!({ "ok": true, "voice": config.tts.voice, "speed": (f64::from(config.tts.speed) * 100.0).round() / 100.0 })
+        );
+    } else {
+        println!("голос {}, скорость {}", config.tts.voice, config.tts.speed);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The widget watches `<runtime>/panel`: "open" or "closed".
+fn panel(action: &str) -> anyhow::Result<ExitCode> {
+    let file = config::runtime_dir()?.join("panel");
+    let open = std::fs::read_to_string(&file).is_ok_and(|s| s.trim() == "open");
+    let next = match action {
+        "open" => true,
+        "close" => false,
+        _ => !open,
+    };
+    if let Some(directory) = file.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    let temporary = file.with_extension("tmp");
+    std::fs::write(&temporary, if next { "open\n" } else { "closed\n" })?;
+    std::fs::rename(temporary, &file)?;
+    println!("{}", if next { "open" } else { "closed" });
     Ok(ExitCode::SUCCESS)
 }
 

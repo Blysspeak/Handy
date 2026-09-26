@@ -151,6 +151,56 @@ pub fn engine(config: &TtsConfig) -> anyhow::Result<Box<dyn Engine>> {
     }
 }
 
+/// "прослушать": an English sentence with 2-3 of the owner's terms, so he
+/// hears how a voice says his words. `seed` picks template and terms.
+pub fn preview_sentence(terms: &[crate::vocabulary::Term], seed: u64) -> String {
+    const TEMPLATES: [&str; 5] = [
+        "Let's push the fix to {a} and check {b} before the release.",
+        "I opened {a} next to {b} to compare the logs.",
+        "Could you rebuild {a} tonight and ping me about {b}?",
+        "The {a} dashboard says {b} and {c} are still running.",
+        "First merge the branch in {a}, then restart {b}.",
+    ];
+    // Latin terms read naturally in an English sentence.
+    let latin: Vec<&str> = terms
+        .iter()
+        .map(|t| t.forms.last().map_or(t.term.as_str(), String::as_str))
+        .filter(|t| t.is_ascii() && !t.trim().is_empty())
+        .collect();
+    let pick = |n: u64| -> &str {
+        if latin.is_empty() {
+            "Hyprland"
+        } else {
+            latin[usize::try_from(n % latin.len() as u64).unwrap_or(0)]
+        }
+    };
+    // A small LCG: different terms per call without a rand dependency.
+    let next = |x: u64| {
+        x.wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+    };
+    let (s1, s2, s3, s4) = (
+        next(seed),
+        next(next(seed)),
+        next(next(next(seed))),
+        next(next(next(next(seed)))),
+    );
+    let template = TEMPLATES[usize::try_from((s1 >> 33) % TEMPLATES.len() as u64).unwrap_or(0)];
+    let a = pick(s2 >> 33);
+    let mut b = pick(s3 >> 33);
+    if b == a && latin.len() > 1 {
+        b = pick((s3 >> 33) + 1);
+    }
+    let mut c = pick(s4 >> 33);
+    if (c == a || c == b) && latin.len() > 2 {
+        c = pick((s4 >> 33) + 2);
+    }
+    template
+        .replace("{a}", a)
+        .replace("{b}", b)
+        .replace("{c}", c)
+}
+
 /// Length of a rendered WAV, for the recognition mute.
 pub fn duration(path: &Path) -> anyhow::Result<std::time::Duration> {
     let reader = hound::WavReader::open(path)?;
@@ -203,6 +253,34 @@ mod tests {
         );
         assert_eq!(Kokoro::language("bm_fable"), "en-gb");
         assert_eq!(Kokoro::language("af_heart"), "en-us");
+    }
+
+    #[test]
+    fn preview_uses_the_owners_latin_terms_and_varies() {
+        let term = |t: &str| crate::vocabulary::Term {
+            term: t.into(),
+            forms: vec![t.into()],
+            source: "owner".into(),
+        };
+        let terms = [
+            term("xhub"),
+            term("Hyprland"),
+            term("Фейбл"),
+            term("aurelius"),
+        ];
+        let sentences: std::collections::BTreeSet<String> =
+            (0..20).map(|seed| preview_sentence(&terms, seed)).collect();
+        assert!(sentences.len() > 3, "{sentences:?}");
+        for sentence in &sentences {
+            assert!(
+                !sentence.contains('{') && !sentence.contains("Фейбл"),
+                "{sentence}"
+            );
+            assert!(["xhub", "Hyprland", "aurelius"]
+                .iter()
+                .any(|t| sentence.contains(t)));
+        }
+        assert!(preview_sentence(&[], 1).contains("Hyprland"));
     }
 
     #[test]

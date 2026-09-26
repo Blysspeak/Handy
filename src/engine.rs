@@ -239,7 +239,7 @@ enum Slot {
 }
 
 pub struct Transcriber {
-    model_path: PathBuf,
+    model_path: Mutex<PathBuf>,
     backend: Backend,
     /// Model language code or "auto"; changed live by `diktor lang`.
     language: Mutex<String>,
@@ -260,7 +260,7 @@ impl Transcriber {
         route: Arc<VoiceRoute>,
     ) -> Arc<Self> {
         Arc::new(Self {
-            model_path,
+            model_path: Mutex::new(model_path),
             backend,
             language: Mutex::new(language),
             languages: Mutex::new(Vec::new()),
@@ -288,15 +288,37 @@ impl Transcriber {
         });
     }
 
+    pub fn model_path(&self) -> PathBuf {
+        voice_lock(&self.model_path).clone()
+    }
+
+    /// `diktor model use`: loads another model; refused while voice mode is on.
+    pub fn reload(self: &Arc<Self>, path: PathBuf) -> Result<()> {
+        anyhow::ensure!(
+            !self.voice_worker_busy(),
+            "voice mode is on; turn it off first"
+        );
+        {
+            let mut slot = voice_lock(&self.slot);
+            anyhow::ensure!(!matches!(*slot, Slot::Leased), "the model is in use");
+            // Drop the old session before the new one loads: one model in memory.
+            *slot = Slot::Loading;
+        }
+        *voice_lock(&self.model_path) = path;
+        self.load_in_background();
+        Ok(())
+    }
+
     fn load(&self) -> Result<Session> {
         let began = Instant::now();
+        let model_path = self.model_path();
         log::info!(
             "Loading model {} (backend {:?})",
-            self.model_path.display(),
+            model_path.display(),
             self.backend
         );
         let model = Model::load_with(
-            &self.model_path,
+            &model_path,
             &ModelOptions {
                 backend: self.backend,
                 device: None,

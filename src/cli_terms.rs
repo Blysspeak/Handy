@@ -52,8 +52,14 @@ pub enum GlossaryAction {
         #[arg(long)]
         json: bool,
     },
-    /// Print the entries.
+    /// Print the entries (pending suggestions marked).
     List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Turn a pending suggestion (claude_glossary = "suggest") on.
+    Approve {
+        spoken: String,
         #[arg(long)]
         json: bool,
     },
@@ -64,6 +70,14 @@ pub enum PhrasesAction {
     /// The newest phrases: raw (recognised), text (pasted), status.
     Recent {
         #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Phrases whose recognised, pasted or corrected text contains QUERY.
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 50)]
         limit: usize,
         #[arg(long)]
         json: bool,
@@ -115,7 +129,7 @@ fn print_json(value: &impl Serialize) -> anyhow::Result<ExitCode> {
 }
 
 pub fn glossary_command(action: GlossaryAction) -> anyhow::Result<ExitCode> {
-    let (journal, _) = open()?;
+    let (journal, config) = open()?;
     match action {
         GlossaryAction::Add {
             spoken,
@@ -129,18 +143,27 @@ pub fn glossary_command(action: GlossaryAction) -> anyhow::Result<ExitCode> {
                 !glossary::normalise(&spoken).is_empty() && !written.trim().is_empty(),
                 "пустая запись"
             );
+            let pending = matches!(source, Source::Claude) && config.claude_glossary == "suggest";
             journal.glossary_add(
                 &spoken,
                 written.trim(),
                 stem,
                 source.as_str(),
                 note.as_deref(),
+                !pending,
             )?;
             let from = glossary::normalise(&spoken);
             if json {
-                return print_json(
-                    &json!({ "ok": true, "from": from, "to": written.trim(), "stem": stem }),
+                return print_json(&json!({
+                    "ok": true, "from": from, "to": written.trim(), "stem": stem, "pending": pending
+                }));
+            }
+            if pending {
+                println!(
+                    "{from} -> {} (ждёт `diktor glossary approve`)",
+                    written.trim()
                 );
+                return Ok(ExitCode::SUCCESS);
             }
             println!(
                 "{from} -> {} ({})",
@@ -169,6 +192,20 @@ pub fn glossary_command(action: GlossaryAction) -> anyhow::Result<ExitCode> {
             }
             println!("удалено: {removed}");
         }
+        GlossaryAction::Approve { spoken, json } => {
+            let approved = journal.glossary_approve(&spoken)?;
+            if json {
+                return print_json(&json!({ "ok": approved > 0, "approved": approved }));
+            }
+            if approved == 0 {
+                eprintln!(
+                    "diktor: нет ожидающей записи: {}",
+                    glossary::normalise(&spoken)
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+            println!("включено: {approved}");
+        }
         GlossaryAction::List { json } => {
             let rows = journal.glossary_rows()?;
             if json {
@@ -182,7 +219,7 @@ pub fn glossary_command(action: GlossaryAction) -> anyhow::Result<ExitCode> {
                     row.to,
                     row.source,
                     row.note.map(|n| format!(", {n}")).unwrap_or_default(),
-                    if row.enabled { "" } else { ", off" }
+                    if row.enabled { "" } else { ", pending" }
                 );
             }
         }
@@ -206,6 +243,18 @@ pub fn phrases_command(action: PhrasesAction) -> anyhow::Result<ExitCode> {
                 };
                 println!(
                     "#{} {} {}: {}{changed}",
+                    row.id, row.created_at, row.status, row.text
+                );
+            }
+        }
+        PhrasesAction::Search { query, limit, json } => {
+            let rows = journal.search(&query, limit)?;
+            if json {
+                return print_json(&rows);
+            }
+            for row in rows {
+                println!(
+                    "#{} {} {}: {}",
                     row.id, row.created_at, row.status, row.text
                 );
             }
