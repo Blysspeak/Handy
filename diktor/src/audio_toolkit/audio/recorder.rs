@@ -192,6 +192,73 @@ impl AudioRecorder {
         self.selected_channel = channel.map(usize::from);
     }
 
+    /// Test input (Diktor): instead of a cpal device, a producer thread plays
+    /// `samples` (mono, `sample_rate`) into the same bounded channel in real
+    /// time, like the cpal callback does: `lead_in` of silence, the samples
+    /// once, then silence until closed. Everything after the channel
+    /// (resampler, VAD, callbacks, boundary markers) is the normal path.
+    pub fn open_wav(
+        &mut self,
+        samples: Arc<Vec<f32>>,
+        sample_rate: u32,
+        lead_in: Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.worker_handle.is_some() && !self.needs_reopen() {
+            return Ok(());
+        }
+        let _ = self.close();
+        self.stream_error.store(false, Ordering::Relaxed);
+        let (sample_tx, sample_rx) = mpsc::sync_channel::<AudioChunk>(256);
+        let sample_tx = Arc::new(Mutex::new(sample_tx));
+        let boundary_tx = sample_tx.clone();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let vad = self.vad.clone();
+        let level_cb = self.level_cb.clone();
+        let audio_cb = self.audio_cb.clone();
+        let voice_activity_cb = self.voice_activity_cb.clone();
+        let stream_error = Arc::clone(&self.stream_error);
+        log::info!(
+            "Using WAV input: {:.2} s at {sample_rate} Hz after {lead_in:?} of silence",
+            samples.len() as f64 / f64::from(sample_rate)
+        );
+        let worker = std::thread::spawn(move || {
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let running = Arc::new(AtomicBool::new(true));
+            let producer = {
+                let stop_flag = Arc::clone(&stop_flag);
+                let running = Arc::clone(&running);
+                std::thread::spawn(move || {
+                    wav_producer(
+                        &samples,
+                        sample_rate,
+                        lead_in,
+                        &sample_tx,
+                        &stop_flag,
+                        &running,
+                        &stream_error,
+                    )
+                })
+            };
+            run_consumer(
+                sample_rate,
+                vad,
+                sample_rx,
+                cmd_rx,
+                level_cb,
+                audio_cb,
+                voice_activity_cb,
+                stop_flag,
+                Instant::now(),
+            );
+            running.store(false, Ordering::Relaxed);
+            let _ = producer.join();
+        });
+        self.cmd_tx = Some(cmd_tx);
+        self.sample_tx = Some(boundary_tx);
+        self.worker_handle = Some(worker);
+        Ok(())
+    }
+
     pub fn open(&mut self, device: Option<Device>) -> Result<(), Box<dyn std::error::Error>> {
         if self.worker_handle.is_some() {
             if !self.needs_reopen() {
@@ -630,6 +697,56 @@ impl AudioRecorder {
             target_rate
         );
         Ok(default_config)
+    }
+}
+
+/// The cpal callback's contract, driven by a clock: 10 ms chunks while
+/// running, one EndOfStream per stop request, nothing while stopped.
+fn wav_producer(
+    samples: &[f32],
+    sample_rate: u32,
+    lead_in: Duration,
+    sample_tx: &Mutex<mpsc::SyncSender<AudioChunk>>,
+    stop_flag: &AtomicBool,
+    running: &AtomicBool,
+    stream_error: &AtomicBool,
+) {
+    let chunk = (sample_rate as usize / 100).max(1);
+    let lead_in_samples = (lead_in.as_secs_f64() * f64::from(sample_rate)) as usize;
+    let started = Instant::now();
+    let mut position = 0usize;
+    let mut eos_sent = false;
+    while running.load(Ordering::Relaxed) {
+        let sender = sample_tx
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if stop_flag.load(Ordering::Relaxed) {
+            if !eos_sent {
+                eos_sent = sender.try_send(AudioChunk::EndOfStream).is_ok();
+            }
+        } else {
+            eos_sent = false;
+            let data: Vec<f32> = (position..position + chunk)
+                .map(|i| {
+                    i.checked_sub(lead_in_samples)
+                        .and_then(|i| samples.get(i))
+                        .copied()
+                        .unwrap_or(0.0)
+                })
+                .collect();
+            position += chunk;
+            if sender.try_send(AudioChunk::Samples(data)).is_err() {
+                log::error!("Failed to send samples");
+                stream_error.store(true, Ordering::Relaxed);
+            }
+        }
+        drop(sender);
+        // Pace by the clock, not by sleeps, so the stream stays real time.
+        let due = started + Duration::from_secs_f64(position as f64 / f64::from(sample_rate));
+        std::thread::sleep(
+            due.saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(1)),
+        );
     }
 }
 

@@ -29,9 +29,48 @@ impl RecordingReadiness {
     }
 }
 
+/// `diktor daemon --input-wav`: replayed at every voice start instead of
+/// opening the microphone (end-to-end checks without any audio device).
+pub struct WavInput {
+    samples: Arc<Vec<f32>>,
+    sample_rate: u32,
+}
+
+impl WavInput {
+    /// Any PCM WAV; channels are averaged to mono like a microphone.
+    pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
+        let mut reader =
+            hound::WavReader::open(path).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let spec = reader.spec();
+        let channels = usize::from(spec.channels.max(1));
+        let interleaved: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => reader.samples::<f32>().collect::<Result<_, _>>()?,
+            hound::SampleFormat::Int => {
+                let scale = (1_i64 << (spec.bits_per_sample.max(1) - 1)) as f32;
+                reader
+                    .samples::<i32>()
+                    .map(|s| s.map(|s| s as f32 / scale))
+                    .collect::<Result<_, _>>()?
+            }
+        };
+        let samples = interleaved
+            .chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+            .collect();
+        Ok(Self {
+            samples: Arc::new(samples),
+            sample_rate: spec.sample_rate,
+        })
+    }
+}
+
+/// Silence before the WAV starts, so the session is listening when it speaks.
+const WAV_LEAD_IN: Duration = Duration::from_millis(800);
+
 pub struct VoiceAudio {
     /// `None` opens the system default input.
     device: Option<String>,
+    wav: Option<WavInput>,
     vad_model: PathBuf,
     route: Arc<VoiceRoute>,
     recorder: Mutex<Option<AudioRecorder>>,
@@ -39,9 +78,15 @@ pub struct VoiceAudio {
 }
 
 impl VoiceAudio {
-    pub fn new(device: Option<String>, vad_model: PathBuf, route: Arc<VoiceRoute>) -> Self {
+    pub fn new(
+        device: Option<String>,
+        wav: Option<WavInput>,
+        vad_model: PathBuf,
+        route: Arc<VoiceRoute>,
+    ) -> Self {
         Self {
             device,
+            wav,
             vad_model,
             route,
             recorder: Mutex::new(None),
@@ -74,6 +119,16 @@ impl VoiceAudio {
             .with_voice_activity_callback(move |speech| activity.voice_activity(speech)))
     }
 
+    /// Refuses a configured microphone that is not there instead of letting
+    /// the sound server fall back to another one.
+    pub fn check_input(&self) -> anyhow::Result<()> {
+        if self.wav.is_some() {
+            return Ok(());
+        }
+        self.resolve_device()?;
+        check_pipewire_node()
+    }
+
     fn resolve_device(&self) -> anyhow::Result<Option<cpal::Device>> {
         let Some(name) = &self.device else {
             return Ok(None);
@@ -96,10 +151,15 @@ impl VoiceAudio {
         if recorder.is_none() {
             *recorder = Some(self.create_recorder().map_err(|e| e.to_string())?);
         }
-        let device = self.resolve_device().map_err(|e| e.to_string())?;
         let rec = recorder.as_mut().ok_or("Recorder not available")?;
-        rec.open(device)
-            .map_err(|e| format!("Failed to open recorder: {e}"))?;
+        match &self.wav {
+            Some(wav) => rec.open_wav(Arc::clone(&wav.samples), wav.sample_rate, WAV_LEAD_IN),
+            None => {
+                let device = self.resolve_device().map_err(|e| e.to_string())?;
+                rec.open(device)
+            }
+        }
+        .map_err(|e| format!("Failed to open recorder: {e}"))?;
         let ready = rec
             .start_with_retention(VadPolicy::Disabled, false)
             .map_err(|e| format!("Failed to start recorder: {e}"))?;
@@ -144,4 +204,29 @@ pub fn device_names() -> anyhow::Result<Vec<(String, bool)>> {
         .into_iter()
         .map(|d| (d.name, d.is_default))
         .collect())
+}
+
+/// `PIPEWIRE_NODE` pins the ALSA stream to one PipeWire node; if that node is
+/// missing PipeWire silently records from the default source instead. Refuse.
+fn check_pipewire_node() -> anyhow::Result<()> {
+    let Ok(node) = std::env::var("PIPEWIRE_NODE") else {
+        return Ok(());
+    };
+    let output = std::process::Command::new("pw-dump")
+        .output()
+        .map_err(|e| anyhow::anyhow!("PIPEWIRE_NODE={node} set, but pw-dump failed: {e}"))?;
+    let objects: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let serial = node.parse::<u64>().ok();
+    let found = objects.as_array().is_some_and(|objects| {
+        objects.iter().any(|object| {
+            let props = &object["info"]["props"];
+            props["node.name"] == node.as_str()
+                || serial.is_some_and(|serial| props["object.serial"].as_u64() == Some(serial))
+        })
+    });
+    anyhow::ensure!(
+        found,
+        "PIPEWIRE_NODE={node}: no such PipeWire node; refusing to fall back to another microphone"
+    );
+    Ok(())
 }

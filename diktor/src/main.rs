@@ -14,7 +14,6 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "diktor", version, about = "Real-time voice input for Hyprland")]
@@ -30,6 +29,10 @@ enum Command {
         /// Config file (default: $DIKTOR_CONFIG or ~/.config/diktor/config.toml).
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Tests: at every voice start play this WAV into the capture
+        /// pipeline instead of opening the microphone.
+        #[arg(long, value_name = "FILE")]
+        input_wav: Option<PathBuf>,
     },
     /// Turn voice mode on or off.
     Toggle,
@@ -42,7 +45,9 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Daemon { config } => daemon(config.unwrap_or_else(config::config_path)),
+        Command::Daemon { config, input_wav } => {
+            daemon(config.unwrap_or_else(config::config_path), input_wav)
+        }
         Command::Toggle => toggle(),
         Command::Status => status(),
         Command::Devices => devices(),
@@ -82,12 +87,25 @@ fn rss_kb() -> Option<u64> {
         .ok()
 }
 
-fn daemon(config_path: PathBuf) -> anyhow::Result<ExitCode> {
+fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<ExitCode> {
     let config = Config::load(&config_path)?;
     init_logging(&config.log_level);
     let model_path = config.model_path()?;
     let vad_model = config.vad_model()?;
     let backend = config.backend()?;
+    let route = Arc::new(engine::VoiceRoute::default());
+    let wav = input_wav
+        .as_deref()
+        .map(audio::WavInput::load)
+        .transpose()?;
+    let audio = Arc::new(audio::VoiceAudio::new(
+        config.input_device(),
+        wav,
+        vad_model,
+        Arc::clone(&route),
+    ));
+    // Before anything is bound or loaded: a missing microphone is fatal.
+    audio.check_input()?;
     let socket = ipc::socket_path(&config::runtime_dir()?);
     let listener = ipc::bind(&socket)?;
     log::info!(
@@ -98,20 +116,11 @@ fn daemon(config_path: PathBuf) -> anyhow::Result<ExitCode> {
     );
 
     engine::init_transcribe_backend();
-    let route = Arc::new(engine::VoiceRoute::default());
-    let transcriber = engine::Transcriber::new(
-        model_path.clone(),
-        backend,
-        config.language.clone(),
-        Arc::clone(&route),
-    );
+    let transcriber =
+        engine::Transcriber::new(model_path.clone(), backend, config.language.clone(), route);
     transcriber.load_in_background();
-    let audio = Arc::new(audio::VoiceAudio::new(
-        config.input_device(),
-        vad_model,
-        route,
-    ));
     let manager = voice_session::VoiceSessionManager::new(audio, Arc::clone(&transcriber));
+    manager.initialize();
 
     let server_manager = Arc::clone(&manager);
     std::thread::spawn(move || {
@@ -148,10 +157,6 @@ fn daemon(config_path: PathBuf) -> anyhow::Result<ExitCode> {
         log::info!("Signal {signal}: stopping");
     }
     manager.shutdown();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while manager.busy() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(30));
-    }
     let _ = std::fs::remove_file(&socket);
     Ok(ExitCode::SUCCESS)
 }

@@ -1,35 +1,43 @@
+mod desktop;
 pub mod state;
 
 use crate::audio::VoiceAudio;
 use crate::engine::{voice_error_code, Transcriber};
+use desktop::DesktopBridge;
 use state::{lock, BoundaryMarker, Snapshot, Status, Target, VoiceQueue, COMMIT_TIMEOUT};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// A terminal may still be reading the bracketed paste when Enter arrives.
+const MIN_PASTE_TO_ENTER: Duration = Duration::from_millis(300);
+
+/// Test safety net: with `DIKTOR_ONLY_WINDOW=<Hyprland window address>` set,
+/// every paste and Enter aimed at any other window is refused before the
+/// helper is asked (the helper still checks focus itself).
+fn only_window_allows(target: &Target) -> Result<(), String> {
+    match std::env::var("DIKTOR_ONLY_WINDOW") {
+        Ok(only) if only != target.id => {
+            log::warn!(
+                "Voice delivery to {} refused: DIKTOR_ONLY_WINDOW={only}",
+                target.id
+            );
+            Err("target_changed".into())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Owns persistent voice lifecycle (the Handy fork's `VoiceSessionManager`
-/// without the Tauri app and overlay). Model work never runs on the audio
-/// thread; stopping invalidates permission to deliver synchronously.
-///
-/// No desktop bridge yet: every phrase is delivered to the log.
+/// without the Tauri app and overlay). Model work and desktop IPC never run
+/// on the audio thread; stopping invalidates permission to paste synchronously.
 pub struct VoiceSessionManager {
     audio: Arc<VoiceAudio>,
     transcription: Arc<Transcriber>,
+    desktop: Mutex<Option<Arc<DesktopBridge>>>,
     session: Mutex<Option<Arc<VoiceQueue>>>,
     generation: AtomicU64,
     busy: AtomicBool,
-}
-
-/// Stands in for the focused window until the desktop bridge is wired in.
-fn log_target() -> Target {
-    Target {
-        id: "log".into(),
-        app_id: "log".into(),
-        pid: std::process::id(),
-        output: String::new(),
-        output_x: 0,
-        output_y: 0,
-    }
 }
 
 impl VoiceSessionManager {
@@ -37,10 +45,44 @@ impl VoiceSessionManager {
         Arc::new(Self {
             audio,
             transcription,
+            desktop: Mutex::new(None),
             session: Mutex::new(None),
             generation: AtomicU64::new(0),
             busy: AtomicBool::new(false),
         })
+    }
+
+    /// Starts the desktop helper (Hyprland or KDE, from XDG_CURRENT_DESKTOP).
+    pub fn initialize(self: &Arc<Self>) {
+        let manager = Arc::clone(self);
+        std::thread::spawn(move || {
+            let weak = Arc::downgrade(&manager);
+            match DesktopBridge::start(move |event, _target| {
+                let Some(manager) = weak.upgrade() else {
+                    return;
+                };
+                match event.as_str() {
+                    "toggle" => manager.toggle(),
+                    "failed" => {
+                        if let Some(queue) = lock(&manager.session).as_ref() {
+                            queue.fault("desktop");
+                        }
+                    }
+                    _ => {}
+                }
+            }) {
+                Ok(bridge) => {
+                    let desktop = if bridge.bar_indicator() {
+                        "Hyprland"
+                    } else {
+                        "KDE"
+                    };
+                    *lock(&manager.desktop) = Some(bridge);
+                    log::info!("Persistent voice keyboard ready ({desktop}); mode off");
+                }
+                Err(error) => log::warn!("Persistent voice keyboard unavailable: {error}"),
+            }
+        });
     }
 
     pub fn snapshot(&self) -> Option<Snapshot> {
@@ -67,10 +109,18 @@ impl VoiceSessionManager {
     }
 
     fn run(self: Arc<Self>, queue: Arc<VoiceQueue>) {
+        let generation = queue.snapshot().generation;
+        let bridge = lock(&self.desktop).clone();
         let mut captured = false;
         let startup = (|| -> Result<(), String> {
             if self.audio.is_recording() || self.transcription.voice_worker_busy() {
                 return Err("busy".into());
+            }
+            let bridge = bridge.as_ref().ok_or("desktop")?;
+            self.publish(&queue);
+            bridge.enable(generation)?;
+            if !queue.active() {
+                return Ok(());
             }
             self.publish(&queue);
             let ready = self
@@ -92,7 +142,7 @@ impl VoiceSessionManager {
             if !capture_ready.wait_timeout(Duration::from_secs(5)) {
                 return Err("microphone".into());
             }
-            // Capture buffers during model loading.
+            // Capture buffers during model loading, after helper enable ACK.
             let began = Instant::now();
             while queue.active() {
                 match ready.recv_timeout(Duration::from_millis(50)) {
@@ -119,6 +169,7 @@ impl VoiceSessionManager {
         }
         let mut previous_revision = u64::MAX;
         let mut committing_since: Option<(u64, Instant)> = None;
+        let mut last_paste = Instant::now();
         while queue.active() {
             self.commit_silence(&queue);
             let snapshot = queue.snapshot();
@@ -145,20 +196,48 @@ impl VoiceSessionManager {
                 queue.fault("microphone");
             }
             if let Some(request) = queue.take_paste() {
-                log::info!(
-                    "Voice phrase {} ({} chars) delivered to the log (target {})",
-                    request.phrase,
-                    request.text.chars().count(),
-                    request.target.app_id
-                );
-                log::debug!("Voice phrase {} text: {}", request.phrase, request.text);
-                queue.paste_done(request.generation, request.phrase, Ok(()));
+                if let Some(bridge) = &bridge {
+                    let began = Instant::now();
+                    let result = if self.generation.load(Ordering::Acquire) == request.generation
+                        && queue.active()
+                    {
+                        only_window_allows(&request.target).and_then(|()| bridge.paste(&request))
+                    } else {
+                        Err("cancelled".into())
+                    };
+                    log::info!(
+                        "Voice paste phrase {} ({} chars) app_id={} in {:?}: {result:?}",
+                        request.phrase,
+                        request.text.chars().count(),
+                        request.target.app_id,
+                        began.elapsed()
+                    );
+                    log::debug!("Voice phrase {} text: {}", request.phrase, request.text);
+                    if result.is_ok() {
+                        last_paste = Instant::now();
+                    }
+                    queue.paste_done(request.generation, request.phrase, result);
+                }
             }
-            if let Some(request) = queue.take_submit() {
-                log::info!("Voice Enter app_id={}: log only", request.target.app_id);
-                queue.submit_done(request.generation, Ok(()));
+            if last_paste.elapsed() >= MIN_PASTE_TO_ENTER {
+                if let (Some(bridge), Some(request)) = (&bridge, queue.take_submit()) {
+                    let result = if self.generation.load(Ordering::Acquire) == request.generation
+                        && queue.active()
+                    {
+                        only_window_allows(&request.target)
+                            .and_then(|()| bridge.submit(request.generation, &request.target))
+                    } else {
+                        Err("cancelled".into())
+                    };
+                    log::info!("Voice Enter app_id={}: {result:?}", request.target.app_id);
+                    queue.submit_done(request.generation, result);
+                }
             }
             std::thread::sleep(Duration::from_millis(30));
+        }
+        // On errors preserve draft text. Both normal off and faults release keys.
+        if let Some(bridge) = &bridge {
+            bridge.disable();
         }
         if captured {
             self.audio.cancel_recording();
@@ -187,17 +266,42 @@ impl VoiceSessionManager {
         let Some(phrase) = queue.reserve_silence_boundary() else {
             return;
         };
-        // Marker first: its FIFO position is the moment silence was measured.
+        // Marker first: its FIFO position is the moment silence was measured,
+        // so speech during the slow focus query starts the next phrase instead
+        // of cancelling this one.
         let marker = BoundaryMarker::new(Arc::clone(queue));
         if let Err(error) = self.audio.voice_boundary(Box::new(move || marker.commit())) {
             log::warn!("Voice boundary marker for phrase {phrase} not queued: {error}");
             queue.fault("microphone");
             return;
         }
-        queue.set_target(phrase, log_target());
+        let bridge = lock(&self.desktop).clone();
+        let queue = Arc::clone(queue);
+        std::thread::spawn(move || {
+            let began = Instant::now();
+            match bridge
+                .ok_or_else(|| "desktop".to_string())
+                .and_then(|b| b.target())
+            {
+                Ok(target) => {
+                    log::info!(
+                        "Voice phrase {phrase} focus query took {:?}",
+                        began.elapsed()
+                    );
+                    queue.set_target(phrase, target);
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Voice phrase {phrase} focus query failed after {:?}: {error}",
+                        began.elapsed()
+                    );
+                    queue.fault("target_unavailable");
+                }
+            }
+        });
     }
 
-    /// Toggle off: unpasted text survives as a draft.
+    /// Toggle off: unpasted text survives as a copyable draft.
     pub fn stop(&self) {
         self.stop_session(true);
     }
@@ -212,6 +316,11 @@ impl VoiceSessionManager {
             if !(keep_draft && queue.cancel_keeping_draft()) {
                 self.transcription.end_voice_session(&queue);
             }
+            if let Some(bridge) = lock(&self.desktop).as_ref() {
+                if bridge.set_generation(0).is_err() {
+                    bridge.kill();
+                }
+            }
             if !self.busy.load(Ordering::Acquire) {
                 queue.stopped();
             }
@@ -219,12 +328,16 @@ impl VoiceSessionManager {
         }
     }
 
+    /// Daemon exit: ends the session and stops the helper, which restores
+    /// Hyprland's follow_mouse.
     pub fn shutdown(&self) {
         self.stop_session(false);
-    }
-
-    /// A voice session (or its teardown) is still running.
-    pub fn busy(&self) -> bool {
-        self.busy.load(Ordering::Acquire)
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.busy.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        if let Some(bridge) = lock(&self.desktop).clone() {
+            bridge.shutdown();
+        }
     }
 }
