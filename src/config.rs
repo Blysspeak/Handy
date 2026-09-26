@@ -31,6 +31,8 @@ pub struct Config {
     pub vocabulary_dirs: Vec<String>,
     /// Subdirectory names too generic to be terms.
     pub vocabulary_skip: Vec<String>,
+    /// `diktor say`: engine, voice, speed.
+    pub tts: crate::tts::TtsConfig,
 }
 
 impl Default for Config {
@@ -46,6 +48,7 @@ impl Default for Config {
             log_level: "info".into(),
             vocabulary_dirs: vec!["~/workSpace/project".into()],
             vocabulary_skip: vec!["src".into(), "archive".into(), "spec-kit".into()],
+            tts: crate::tts::TtsConfig::default(),
         }
     }
 }
@@ -278,5 +281,6 @@ mod tests {
         assert_eq!(config.backend, defaults.backend);
         assert_eq!(config.keep_days, defaults.keep_days);
         assert_eq!(config.keep_phrases, defaults.keep_phrases);
+        assert_eq!(config.tts, defaults.tts);
     }
 }

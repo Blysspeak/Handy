@@ -167,18 +167,43 @@ fn voice_language(requested: &str, languages: &[String]) -> Result<Option<String
 #[derive(Default)]
 pub struct VoiceRoute {
     voice: Mutex<Option<Arc<VoiceQueue>>>,
+    /// Echo guard: while `diktor say` plays (and a short tail after), the
+    /// model hears silence and the VAD reports no speech.
+    muted_until: Mutex<Option<Instant>>,
 }
 
+/// Room echo and the output buffer outlast the playback a little.
+pub const ECHO_TAIL: Duration = Duration::from_millis(300);
+
 impl VoiceRoute {
+    fn muted(&self) -> bool {
+        voice_lock(&self.muted_until).is_some_and(|until| Instant::now() < until)
+    }
+
+    /// Mutes recognition for at most `cap` (a crashed `say` cannot mute forever).
+    pub fn mute(&self, cap: Duration) {
+        *voice_lock(&self.muted_until) = Some(Instant::now() + cap);
+    }
+
+    /// Playback ended: recognition resumes after the echo tail.
+    pub fn unmute(&self) {
+        *voice_lock(&self.muted_until) = Some(Instant::now() + ECHO_TAIL);
+    }
+
     pub fn feed(&self, frame: &[f32]) {
         if let Some(voice) = voice_lock(&self.voice).as_ref() {
-            voice.feed(frame);
+            if self.muted() {
+                // Same timing, no sound: phrase boundaries keep working.
+                voice.feed(&vec![0.0; frame.len()]);
+            } else {
+                voice.feed(frame);
+            }
         }
     }
 
     pub fn voice_activity(&self, speech: bool) {
         if let Some(queue) = voice_lock(&self.voice).as_ref() {
-            queue.speech_activity(speech);
+            queue.speech_activity(speech && !self.muted());
         }
     }
 }
@@ -512,6 +537,32 @@ mod voice_pipeline_tests {
         assert_eq!(phrases.len(), 2);
         assert_eq!(&phrases[0][..2], &[1., 2.]);
         assert_eq!(&phrases[1][..2], &[3., 4.]);
+    }
+
+    #[test]
+    fn echo_guard_feeds_silence_and_no_speech_while_muted() {
+        let queue = Arc::new(VoiceQueue::new(1));
+        queue.ready();
+        let route = VoiceRoute::default();
+        *voice_lock(&route.voice) = Some(Arc::clone(&queue));
+        route.mute(Duration::from_secs(5));
+        route.voice_activity(true);
+        route.feed(&[0.5, 0.5]);
+        assert!(!queue.snapshot().speech_active);
+        match queue.recv() {
+            VoiceCommand::Feed { pcm, .. } => assert_eq!(pcm, [0.0, 0.0]),
+            _ => panic!("expected a frame"),
+        }
+        route.unmute();
+        assert!(route.muted(), "echo tail still muted");
+        *voice_lock(&route.muted_until) = Some(Instant::now());
+        route.voice_activity(true);
+        route.feed(&[0.5]);
+        assert!(queue.snapshot().speech_active);
+        match queue.recv() {
+            VoiceCommand::Feed { pcm, .. } => assert_eq!(pcm, [0.5]),
+            _ => panic!("expected a frame"),
+        }
     }
 
     #[test]

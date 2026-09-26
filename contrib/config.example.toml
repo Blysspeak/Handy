@@ -34,3 +34,12 @@ log_level = "info"
 # also "xhub devbot"); `diktor vocab list` shows the effective list.
 vocabulary_dirs = ["~/workSpace/project"]
 vocabulary_skip = ["src", "archive", "spec-kit"]
+
+# `diktor say`: text to speech (English lessons). While diktor speaks, voice
+# mode hears silence, so its own voice is never typed.
+[tts]
+engine = "kokoro"
+voice = "bm_fable"
+speed = 0.95
+kokoro_helper = "~/.local/bin/say-en"
+kokoro_home = "~/.local/share/kokoro"

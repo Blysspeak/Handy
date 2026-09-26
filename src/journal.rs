@@ -65,7 +65,15 @@ CREATE TABLE IF NOT EXISTS vocabulary (
     created_at INTEGER NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1
 );
-PRAGMA user_version = 2;
+CREATE TABLE IF NOT EXISTS tts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    engine TEXT NOT NULL,
+    voice TEXT NOT NULL,
+    speed REAL NOT NULL
+);
+PRAGMA user_version = 3;
 ";
 
 /// Imported once, on the first open of a database (`meta.seeded`); entries
@@ -387,6 +395,21 @@ impl Journal {
                 })
             })?;
         rows.collect()
+    }
+
+    /// One `diktor say` utterance (lessons: what was said, in which voice).
+    pub fn tts_spoken(
+        &self,
+        text: &str,
+        engine: &str,
+        voice: &str,
+        speed: f32,
+    ) -> rusqlite::Result<()> {
+        lock(&self.connection).execute(
+            "INSERT INTO tts (created_at, text, engine, voice, speed) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now_ms(), text, engine, voice, f64::from(speed)],
+        )?;
+        Ok(())
     }
 
     /// Stores the right text for phrase `id`; false when there is no such phrase.
@@ -783,6 +806,30 @@ mod tests {
         assert_eq!(
             journal.recent(10).unwrap()[1].corrected.as_deref(),
             Some("сделай commit и push")
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn spoken_utterances_are_logged() {
+        let path = database("tts");
+        let journal = Journal::open_at(&path, "run-a".into(), 30, 1000).unwrap();
+        journal
+            .tts_spoken(
+                "I would rather think it through.",
+                "kokoro",
+                "bm_fable",
+                0.95,
+            )
+            .unwrap();
+        let (text, voice): (String, String) = lock(&journal.connection)
+            .query_row("SELECT text, voice FROM tts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(
+            (text.as_str(), voice.as_str()),
+            ("I would rather think it through.", "bm_fable")
         );
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }

@@ -9,6 +9,7 @@ mod engine;
 mod glossary;
 mod ipc;
 mod journal;
+mod tts;
 mod vocabulary;
 mod voice_session;
 
@@ -77,6 +78,26 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Speak English text (Kokoro); voice mode ignores the microphone meanwhile.
+    Say {
+        /// Text; read from stdin when empty.
+        text: Vec<String>,
+        #[arg(long)]
+        voice: Option<String>,
+        #[arg(long)]
+        speed: Option<f32>,
+        /// Practice speed (0.75).
+        #[arg(long)]
+        slow: bool,
+        /// Write the WAV here instead of playing it.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// List the engine's voices.
+        #[arg(long)]
+        list_voices: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Input device names accepted by `input_device` in the config.
     Devices,
 }
@@ -106,6 +127,22 @@ fn main() -> ExitCode {
         Command::Phrases { action } => cli_terms::phrases_command(action),
         Command::Vocab { action } => cli_terms::vocab_command(action),
         Command::Misses { days, json } => cli_terms::misses_command(days, json),
+        Command::Say {
+            text,
+            voice,
+            speed,
+            slow,
+            out,
+            list_voices,
+            json,
+        } => say(SayArgs {
+            text,
+            voice,
+            speed: if slow { Some(tts::SLOW_SPEED) } else { speed },
+            out,
+            list_voices,
+            json,
+        }),
         Command::Devices => devices(),
     };
     match result {
@@ -181,8 +218,12 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
     );
 
     engine::init_transcribe_backend();
-    let transcriber =
-        engine::Transcriber::new(model_path.clone(), backend, config.language.clone(), route);
+    let transcriber = engine::Transcriber::new(
+        model_path.clone(),
+        backend,
+        config.language.clone(),
+        Arc::clone(&route),
+    );
     transcriber.load_in_background();
     let glossary = Arc::new(glossary::Glossary::new(Arc::clone(&journal)));
     let manager = voice_session::VoiceSessionManager::new(
@@ -211,6 +252,20 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
                 "off" => {
                     server_manager.stop();
                     json!({ "ok": true, "voice": voice(&server_manager) })
+                }
+                // `diktor say` is about to play / has played.
+                mute if mute.starts_with("mute ") => {
+                    let cap = mute
+                        .trim_start_matches("mute ")
+                        .trim()
+                        .parse()
+                        .unwrap_or(0_u64);
+                    route.mute(std::time::Duration::from_millis(cap.min(120_000)));
+                    json!({ "ok": true })
+                }
+                "unmute" => {
+                    route.unmute();
+                    json!({ "ok": true })
                 }
                 "status" => json!({
                     "ok": true,
@@ -364,6 +419,70 @@ fn lang(code: &str) -> anyhow::Result<ExitCode> {
             path.display()
         );
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+struct SayArgs {
+    text: Vec<String>,
+    voice: Option<String>,
+    speed: Option<f32>,
+    out: Option<PathBuf>,
+    list_voices: bool,
+    json: bool,
+}
+
+fn say(args: SayArgs) -> anyhow::Result<ExitCode> {
+    let config = Config::load(&config::config_path())?;
+    let engine = tts::engine(&config.tts)?;
+    if args.list_voices {
+        let voices = engine.voices()?;
+        if args.json {
+            println!("{}", serde_json::to_string(&voices)?);
+        } else {
+            for voice in voices {
+                let current = if voice.id == config.tts.voice {
+                    "  (config)"
+                } else {
+                    ""
+                };
+                println!("{} {}{current}", voice.id, voice.language);
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut text = args.text.join(" ");
+    if text.trim().is_empty() {
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
+    }
+    let text = text.trim().to_string();
+    anyhow::ensure!(!text.is_empty(), "нет текста");
+    let voice = args.voice.unwrap_or_else(|| config.tts.voice.clone());
+    let speed = args.speed.unwrap_or(config.tts.speed);
+    anyhow::ensure!(
+        (0.25..=4.0).contains(&speed),
+        "speed {speed}: ожидается 0.25..4"
+    );
+    if let Some(out) = &args.out {
+        engine.render(&text, &voice, speed, out)?;
+        println!("{}", out.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+    let file = config::runtime_dir()?.join(format!("say-{}.wav", std::process::id()));
+    if let Some(directory) = file.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    engine.render(&text, &voice, speed, &file)?;
+    let length = tts::duration(&file)?;
+    // Echo guard: the daemon (if any) hears silence until the tail has passed.
+    let socket = socket()?;
+    let cap = length + std::time::Duration::from_secs(3);
+    let _ = ipc::request(&socket, &format!("mute {}", cap.as_millis()));
+    let played = tts::play(&file);
+    let _ = ipc::request(&socket, "unmute");
+    let _ = std::fs::remove_file(&file);
+    played?;
+    let journal = Journal::open(&config::data_dir(), config.keep_days, config.keep_phrases)?;
+    journal.tts_spoken(&text, engine.name(), &voice, speed)?;
     Ok(ExitCode::SUCCESS)
 }
 
