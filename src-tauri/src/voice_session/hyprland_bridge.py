@@ -170,6 +170,9 @@ def main(directory, parent):
             raise BridgeError("target_unavailable") from error
         target = target_of(window, monitors)
         if not same_target(target, target):
+            # No window focused at all, or one without class or pid.
+            log(f"no usable focused window: address={window.get('address')!r} "
+                f"class={window.get('class')!r} pid={window.get('pid')!r}")
             raise BridgeError("target_unavailable")
         return target
 
