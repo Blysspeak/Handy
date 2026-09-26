@@ -10,6 +10,25 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type Reply = mpsc::SyncSender<Result<Value, String>>;
 
+/// Which helper speaks the voice protocol for this session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Desktop {
+    Kde,
+    Hyprland,
+}
+
+/// From `XDG_CURRENT_DESKTOP`; KDE wins if a session names both.
+fn detect(current_desktop: &str) -> Option<Desktop> {
+    let current_desktop = current_desktop.to_lowercase();
+    if current_desktop.contains("kde") {
+        Some(Desktop::Kde)
+    } else if current_desktop.contains("hyprland") {
+        Some(Desktop::Hyprland)
+    } else {
+        None
+    }
+}
+
 pub struct DesktopBridge {
     input: Mutex<ChildStdin>,
     child: Mutex<Child>,
@@ -26,15 +45,12 @@ impl DesktopBridge {
     pub fn start(
         on_event: impl Fn(String, Option<Target>) + Send + Sync + 'static,
     ) -> Result<Arc<Self>, String> {
-        if !cfg!(target_os = "linux")
-            || std::env::var_os("WAYLAND_DISPLAY").is_none()
-            || !std::env::var("XDG_CURRENT_DESKTOP")
-                .unwrap_or_default()
-                .to_lowercase()
-                .contains("kde")
-        {
+        let desktop = detect(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default());
+        let Some(desktop) = desktop
+            .filter(|_| cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some())
+        else {
             return Err("unsupported_desktop".into());
-        }
+        };
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|_| "desktop")?
@@ -48,8 +64,13 @@ impl DesktopBridge {
             std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
                 .map_err(|_| "desktop")?;
         }
-        let script = directory.join("kde_bridge.py");
+        let mut script = directory.join("kde_bridge.py");
         std::fs::write(&script, include_str!("kde_bridge.py")).map_err(|_| "desktop")?;
+        if desktop == Desktop::Hyprland {
+            // Imports its guarded paste/Enter from kde_bridge.py next to it.
+            script = directory.join("hyprland_bridge.py");
+            std::fs::write(&script, include_str!("hyprland_bridge.py")).map_err(|_| "desktop")?;
+        }
         std::fs::write(directory.join("generation"), "0").map_err(|_| "desktop")?;
         let mut child = Command::new("python3")
             .arg(&script)
@@ -222,6 +243,16 @@ mod tests {
             super::paste_error("target_changed".into()),
             "target_changed"
         );
+    }
+
+    #[test]
+    fn voice_bridge_follows_current_desktop_and_kde_keeps_its_helper() {
+        use super::{detect, Desktop};
+        assert_eq!(detect("KDE"), Some(Desktop::Kde));
+        assert_eq!(detect("Hyprland"), Some(Desktop::Hyprland));
+        assert_eq!(detect("Hyprland:KDE"), Some(Desktop::Kde));
+        assert_eq!(detect("GNOME"), None);
+        assert_eq!(detect(""), None);
     }
 
     #[test]
