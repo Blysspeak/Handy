@@ -1,12 +1,18 @@
+mod bar_state;
 mod desktop;
 pub mod state;
 
 use crate::audio::VoiceAudio;
 use crate::engine::{voice_error_code, Transcriber};
+use crate::journal::{Journal, Phrase};
+use bar_state::BarState;
 use desktop::DesktopBridge;
-use state::{lock, BoundaryMarker, Snapshot, Status, Target, VoiceQueue, COMMIT_TIMEOUT};
+use state::{
+    lock, BoundaryMarker, PasteRequest, Snapshot, Status, Target, VoiceQueue, COMMIT_TIMEOUT,
+};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// A terminal may still be reading the bracketed paste when Enter arrives.
@@ -38,18 +44,36 @@ pub struct VoiceSessionManager {
     session: Mutex<Option<Arc<VoiceQueue>>>,
     generation: AtomicU64,
     busy: AtomicBool,
+    /// Every recognised phrase, on disk before its paste.
+    journal: Arc<Journal>,
+    /// The popup's phrases, reloaded whenever the journal changes them.
+    rescue: Mutex<Vec<Phrase>>,
+    /// Hyprland only: state goes to the Omarchy bar widget.
+    bar: OnceLock<BarState>,
+    runtime: PathBuf,
 }
 
 impl VoiceSessionManager {
-    pub fn new(audio: Arc<VoiceAudio>, transcription: Arc<Transcriber>) -> Arc<Self> {
-        Arc::new(Self {
+    pub fn new(
+        audio: Arc<VoiceAudio>,
+        transcription: Arc<Transcriber>,
+        journal: Arc<Journal>,
+        runtime: PathBuf,
+    ) -> Arc<Self> {
+        let manager = Arc::new(Self {
             audio,
             transcription,
             desktop: Mutex::new(None),
             session: Mutex::new(None),
             generation: AtomicU64::new(0),
             busy: AtomicBool::new(false),
-        })
+            journal,
+            rescue: Mutex::new(Vec::new()),
+            bar: OnceLock::new(),
+            runtime,
+        });
+        manager.reload_rescue();
+        manager
     }
 
     /// Starts the desktop helper (Hyprland or KDE, from XDG_CURRENT_DESKTOP).
@@ -77,6 +101,11 @@ impl VoiceSessionManager {
                     } else {
                         "KDE"
                     };
+                    if bridge.bar_indicator() {
+                        let _ = manager.bar.set(BarState::new(manager.runtime.clone()));
+                        // Also shows text an earlier run could not insert.
+                        manager.refresh_bar(None);
+                    }
                     *lock(&manager.desktop) = Some(bridge);
                     log::info!("Persistent voice keyboard ready ({desktop}); mode off");
                 }
@@ -90,6 +119,8 @@ impl VoiceSessionManager {
     }
 
     pub fn toggle(self: &Arc<Self>) {
+        // Toggling either way closes the rescue popup; the text stays waiting.
+        self.dismiss_rescue();
         if self.busy.load(Ordering::Acquire) {
             self.stop();
             return;
@@ -170,8 +201,11 @@ impl VoiceSessionManager {
         let mut previous_revision = u64::MAX;
         let mut committing_since: Option<(u64, Instant)> = None;
         let mut last_paste = Instant::now();
+        // Journaled phrases of this session still waiting for an outcome.
+        let mut in_flight = Vec::new();
         while queue.active() {
             self.commit_silence(&queue);
+            self.journal_finals(&queue, &mut in_flight);
             let snapshot = queue.snapshot();
             if snapshot.revision != previous_revision {
                 self.publish(&queue);
@@ -196,6 +230,9 @@ impl VoiceSessionManager {
                 queue.fault("microphone");
             }
             if let Some(request) = queue.take_paste() {
+                // A phrase finalised since the loop's first write is on disk
+                // before its paste too.
+                self.journal_finals(&queue, &mut in_flight);
                 if let Some(bridge) = &bridge {
                     let began = Instant::now();
                     let result = if self.generation.load(Ordering::Acquire) == request.generation
@@ -216,6 +253,7 @@ impl VoiceSessionManager {
                     if result.is_ok() {
                         last_paste = Instant::now();
                     }
+                    self.journal_outcome(&request, &result, &mut in_flight);
                     queue.paste_done(request.generation, request.phrase, result);
                 }
             }
@@ -239,6 +277,7 @@ impl VoiceSessionManager {
         if let Some(bridge) = &bridge {
             bridge.disable();
         }
+        self.journal_leftovers(&queue, &mut in_flight);
         if captured {
             self.audio.cancel_recording();
         }
@@ -260,6 +299,105 @@ impl VoiceSessionManager {
             snapshot.phrase,
             snapshot.speech_active
         );
+        self.refresh_bar(Some(&snapshot));
+    }
+
+    /// Every final phrase not yet on disk is written (fsync) now, before
+    /// the loop can take its paste.
+    fn journal_finals(&self, queue: &VoiceQueue, in_flight: &mut Vec<u64>) {
+        for (generation, phrase, text, target) in queue.take_unjournaled() {
+            match self
+                .journal
+                .phrase(generation, phrase, &text, target.as_ref())
+            {
+                Ok(()) => in_flight.push(phrase),
+                Err(error) => log::error!("Voice phrase {phrase} not journaled: {error}"),
+            }
+        }
+    }
+
+    fn journal_outcome(
+        &self,
+        request: &PasteRequest,
+        result: &Result<(), String>,
+        in_flight: &mut Vec<u64>,
+    ) {
+        let before = in_flight.len();
+        in_flight.retain(|phrase| *phrase != request.phrase);
+        if in_flight.len() == before {
+            return;
+        }
+        let (generation, phrase) = (request.generation, request.phrase);
+        let written = match result {
+            Ok(()) => self.journal.delivered(generation, phrase, &request.target),
+            Err(reason) => self
+                .journal
+                .failed(generation, phrase, reason, Some(&request.target)),
+        };
+        if let Err(error) = written {
+            log::error!("Voice phrase {phrase} outcome not journaled: {error}");
+        }
+        if result.is_err() {
+            self.reload_rescue();
+        }
+    }
+
+    /// When a session ends nothing dictated may live only in memory: finals
+    /// that never reached a paste, speech still being decoded, and phrases
+    /// whose paste never reported back are kept as failed.
+    fn journal_leftovers(&self, queue: &VoiceQueue, in_flight: &mut Vec<u64>) {
+        self.journal_finals(queue, in_flight);
+        let snapshot = queue.snapshot();
+        let unfinished = queue.unfinished_text();
+        if !unfinished.is_empty() {
+            // Phrase numbers start at 1, so 0 cannot collide.
+            match self
+                .journal
+                .phrase(snapshot.generation, 0, &unfinished, None)
+            {
+                Ok(()) => in_flight.push(0),
+                Err(error) => log::error!("Voice unfinished text not journaled: {error}"),
+            }
+        }
+        let reason = snapshot.error.unwrap_or_else(|| "cancelled".to_string());
+        for phrase in in_flight.drain(..) {
+            log::warn!("Voice phrase {phrase} kept undelivered: {reason}");
+            if let Err(error) = self
+                .journal
+                .failed(snapshot.generation, phrase, &reason, None)
+            {
+                log::error!("Voice phrase {phrase} outcome not journaled: {error}");
+            }
+        }
+        self.reload_rescue();
+    }
+
+    /// Re-reads the popup's phrases (after a failure, copy or dismiss).
+    pub fn reload_rescue(&self) {
+        match self.journal.rescue() {
+            Ok(rescue) => *lock(&self.rescue) = rescue,
+            Err(error) => log::error!("Voice journal not readable: {error}"),
+        }
+    }
+
+    /// Hyprland: the bar icon follows the session, the popup the journal.
+    pub fn refresh_bar(&self, snapshot: Option<&Snapshot>) {
+        if let Some(bar) = self.bar.get() {
+            bar.show(snapshot, &lock(&self.rescue));
+        }
+    }
+
+    /// Closes the rescue popup; its phrases stay waiting for `diktor copy`.
+    fn dismiss_rescue(&self) {
+        let ids: Vec<i64> = lock(&self.rescue).iter().map(|p| p.id).collect();
+        if ids.is_empty() {
+            return;
+        }
+        if let Err(error) = self.journal.dismissed(&ids) {
+            log::error!("Voice rescue not dismissed: {error}");
+        }
+        self.reload_rescue();
+        self.refresh_bar(self.snapshot().as_ref());
     }
 
     fn commit_silence(self: &Arc<Self>, queue: &Arc<VoiceQueue>) {
@@ -301,7 +439,7 @@ impl VoiceSessionManager {
         });
     }
 
-    /// Toggle off: unpasted text survives as a copyable draft.
+    /// Voice off: unpasted text survives as a copyable draft. No-op when off.
     pub fn stop(&self) {
         self.stop_session(true);
     }

@@ -6,10 +6,12 @@ mod audio_toolkit;
 mod config;
 mod engine;
 mod ipc;
+mod journal;
 mod voice_session;
 
 use clap::{Parser, Subcommand};
 use config::Config;
+use journal::Journal;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,8 +38,16 @@ enum Command {
     },
     /// Turn voice mode on or off.
     Toggle,
+    /// Turn voice mode off; nothing happens when it is already off.
+    Off,
     /// Daemon, model and voice mode state.
     Status,
+    /// Copy text no window received to the clipboard: without N, what the
+    /// bar popup shows (else everything not copied yet); with N, the last N
+    /// undelivered phrases, copied before or not.
+    Copy { n: Option<usize> },
+    /// Close the bar popup; its phrases stay in the journal for `copy`.
+    Dismiss,
     /// Input device names accepted by `input_device` in the config.
     Devices,
 }
@@ -48,8 +58,11 @@ fn main() -> ExitCode {
         Command::Daemon { config, input_wav } => {
             daemon(config.unwrap_or_else(config::config_path), input_wav)
         }
-        Command::Toggle => toggle(),
+        Command::Toggle => send("toggle"),
+        Command::Off => send("off"),
         Command::Status => status(),
+        Command::Copy { n } => copy(n),
+        Command::Dismiss => dismiss(),
         Command::Devices => devices(),
     };
     match result {
@@ -106,7 +119,9 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
     ));
     // Before anything is bound or loaded: a missing microphone is fatal.
     audio.check_input()?;
-    let socket = ipc::socket_path(&config::runtime_dir()?);
+    let runtime = config::runtime_dir()?;
+    let socket = ipc::socket_path(&runtime);
+    // Only one daemon gets past this; the journal below is then ours.
     let listener = ipc::bind(&socket)?;
     log::info!(
         "Diktor {} daemon (pid {}), config {}",
@@ -114,12 +129,24 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
         std::process::id(),
         config_path.display()
     );
+    let data = config::data_dir();
+    let journal = Arc::new(Journal::open(&data, config.keep_days, config.keep_phrases)?);
+    let interrupted = journal.interrupt_pending()?;
+    log::info!(
+        "Phrase journal {} ({interrupted} interrupted phrase(s) of an earlier run)",
+        data.join("diktor.db").display()
+    );
 
     engine::init_transcribe_backend();
     let transcriber =
         engine::Transcriber::new(model_path.clone(), backend, config.language.clone(), route);
     transcriber.load_in_background();
-    let manager = voice_session::VoiceSessionManager::new(audio, Arc::clone(&transcriber));
+    let manager = voice_session::VoiceSessionManager::new(
+        audio,
+        Arc::clone(&transcriber),
+        Arc::clone(&journal),
+        runtime,
+    );
     manager.initialize();
 
     let server_manager = Arc::clone(&manager);
@@ -136,6 +163,10 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
                     server_manager.toggle();
                     json!({ "ok": true, "voice": voice(&server_manager) })
                 }
+                "off" => {
+                    server_manager.stop();
+                    json!({ "ok": true, "voice": voice(&server_manager) })
+                }
                 "status" => json!({
                     "ok": true,
                     "pid": std::process::id(),
@@ -143,7 +174,15 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
                     "model": transcriber.model_state(),
                     "model_path": model_path.display().to_string(),
                     "rss_kb": rss_kb(),
+                    "waiting": journal.waiting().map(|w| w.len()).ok(),
+                    "rescue": journal.rescue().map(|r| r.len()).ok(),
                 }),
+                // The CLI changed the journal (copy, dismiss): redraw the bar.
+                "refresh" => {
+                    server_manager.reload_rescue();
+                    server_manager.refresh_bar(server_manager.snapshot().as_ref());
+                    json!({ "ok": true })
+                }
                 other => json!({ "ok": false, "error": format!("unknown request {other:?}") }),
             }
         })
@@ -169,8 +208,8 @@ fn not_running(error: anyhow::Error) -> anyhow::Error {
     anyhow::anyhow!("демон не отвечает ({error}); запуск: systemctl --user start diktor")
 }
 
-fn toggle() -> anyhow::Result<ExitCode> {
-    let reply = ipc::request(&socket()?, "toggle").map_err(not_running)?;
+fn send(request: &str) -> anyhow::Result<ExitCode> {
+    let reply = ipc::request(&socket()?, request).map_err(not_running)?;
     println!("{}", reply["voice"].as_str().unwrap_or("?"));
     Ok(exit_code(&reply))
 }
@@ -192,7 +231,57 @@ fn status() -> anyhow::Result<ExitCode> {
     println!("voice: {}", text("voice"));
     println!("model: {} ({})", text("model"), text("model_path"));
     println!("rss: {} kB", text("rss_kb"));
+    println!(
+        "undelivered: {} not copied, {} in the bar popup",
+        text("waiting"),
+        text("rescue")
+    );
     Ok(exit_code(&reply))
+}
+
+/// The CLI works on the journal directly, so rescue works with the daemon
+/// dead too; then pending rows of the dead run can never be delivered.
+fn open_journal() -> anyhow::Result<(Journal, PathBuf)> {
+    let config = Config::load(&config::config_path())?;
+    let socket = socket()?;
+    let journal = Journal::open(&config::data_dir(), config.keep_days, config.keep_phrases)?;
+    if ipc::request(&socket, "status").is_err() {
+        journal.interrupt_pending()?;
+    }
+    Ok((journal, socket))
+}
+
+fn copy(n: Option<usize>) -> anyhow::Result<ExitCode> {
+    let (journal, socket) = open_journal()?;
+    let phrases = match n {
+        Some(n) => journal.last_undelivered(n)?,
+        None => {
+            let rescue = journal.rescue()?;
+            if rescue.is_empty() {
+                journal.waiting()?
+            } else {
+                rescue
+            }
+        }
+    };
+    if phrases.is_empty() {
+        eprintln!("diktor: нечего копировать — всё надиктованное вставлено");
+        return Ok(ExitCode::FAILURE);
+    }
+    journal::copy_to_clipboard(&journal::joined(&phrases)).map_err(anyhow::Error::msg)?;
+    let ids: Vec<i64> = phrases.iter().map(|p| p.id).collect();
+    journal.copied(&ids)?;
+    let _ = ipc::request(&socket, "refresh");
+    println!("скопировано фраз: {}", phrases.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn dismiss() -> anyhow::Result<ExitCode> {
+    let (journal, socket) = open_journal()?;
+    let ids: Vec<i64> = journal.rescue()?.iter().map(|p| p.id).collect();
+    journal.dismissed(&ids)?;
+    let _ = ipc::request(&socket, "refresh");
+    Ok(ExitCode::SUCCESS)
 }
 
 fn exit_code(reply: &Value) -> ExitCode {

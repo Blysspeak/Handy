@@ -70,6 +70,13 @@ pub fn config_path() -> PathBuf {
         .unwrap_or_else(|| xdg("XDG_CONFIG_HOME", ".config").join("diktor/config.toml"))
 }
 
+/// Phrase journal directory: `$DIKTOR_DATA_DIR`, else `$XDG_DATA_HOME/diktor`.
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("DIKTOR_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| xdg("XDG_DATA_HOME", ".local/share").join("diktor"))
+}
+
 /// Socket and bar state: `$DIKTOR_RUNTIME_DIR`, else `$XDG_RUNTIME_DIR/diktor`
 /// (the path the Omarchy bar widget watches).
 pub fn runtime_dir() -> anyhow::Result<PathBuf> {
