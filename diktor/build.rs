@@ -9,10 +9,5 @@ fn main() {
     if let Some(runtime) = std::env::var_os("DEP_TRANSCRIBE_CPP_RUNTIME_DIR") {
         let runtime = std::path::PathBuf::from(runtime);
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", runtime.display());
-        // scripts/install.sh copies the shared libraries from here.
-        println!(
-            "cargo:rustc-env=DIKTOR_BUILD_RUNTIME_DIR={}",
-            runtime.display()
-        );
     }
 }

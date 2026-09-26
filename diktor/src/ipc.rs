@@ -50,6 +50,7 @@ pub fn serve(listener: UnixListener, handle: impl Fn(&str) -> Value + Send + Syn
             if reader.read_line(&mut line).is_err() {
                 return;
             }
+            log::debug!("IPC request {:?}", line.trim());
             let reply = handle(line.trim());
             let mut writer = &stream;
             let _ = writeln!(writer, "{reply}");
