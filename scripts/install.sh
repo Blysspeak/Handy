@@ -32,8 +32,9 @@ mv "$prefix.tmp" "$prefix"
 if ldd "$prefix/bin/diktor" | grep -q "not found"; then
   echo "install.sh: unresolved libraries" >&2; ldd "$prefix/bin/diktor" >&2; exit 1
 fi
-ldd "$prefix/bin/diktor" | grep -q "$prefix/lib/diktor/libtranscribe" \
-  || { echo "install.sh: libtranscribe not taken from $prefix" >&2; exit 1; }
+resolved=$(readlink -f "$(ldd "$prefix/bin/diktor" | awk '/libtranscribe/ {print $3}')")
+[ "$(dirname "$resolved")" = "$prefix/lib/diktor" ] \
+  || { echo "install.sh: libtranscribe taken from $resolved, not $prefix" >&2; exit 1; }
 
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$prefix/bin/diktor" "$HOME/.local/bin/diktor"
