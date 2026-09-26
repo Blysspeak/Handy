@@ -9,7 +9,8 @@
     "dismiss": "Close voice mode",
     "copied": "Copied",
     "copyFailed": "Could not copy",
-    "barCopyHint": "Right-click the icon to copy the draft.",
+    "barWaiting": "Not inserted: {{count}}",
+    "barWaitingHint": "Click to copy all of it; middle-click turns voice mode on or off.",
     "errors": {
       "target_changed": "Return to the selected window, or copy the draft.",
       "target_unavailable": "The selected window is unavailable. You can copy the draft.",
@@ -23,7 +24,8 @@
       "desktop": "Could not insert text. Return to the selected window, or copy the draft.",
       "busy": "The previous recording is still finishing. Try again shortly.",
       "cancelled": "Insertion was cancelled. You can copy the draft.",
-      "delivery_uncertain": "Text may already be inserted or sent. Check the window; your draft is saved."
+      "delivery_uncertain": "Text may already be inserted or sent. Check the window; your draft is saved.",
+      "interrupted": "Diktor stopped before the text was inserted. The text is saved."
     }
   },
   "tray": {

@@ -95,6 +95,8 @@ struct Pending {
     /// Captured audio in this phrase, for the final/dropped log line.
     samples: usize,
     committed_at: Instant,
+    /// Final text already handed out for the durable journal.
+    journaled: bool,
 }
 
 /// Field diagnostics for the phrase being captured; cleared at its commit.
@@ -452,6 +454,7 @@ impl VoiceQueue {
             preview: s.input_text.clone(),
             samples: s.input_samples,
             committed_at: Instant::now(),
+            journaled: false,
         };
         s.pending.push_back(pending);
         s.commands.push_back(VoiceCommand::Commit { phrase });
@@ -582,6 +585,47 @@ impl VoiceQueue {
             .is_some_and(|p| p.text.as_ref().is_some_and(|text| text.trim().is_empty()))
         {
             s.pending.pop_front();
+        }
+    }
+
+    /// Final phrase texts not yet in the durable journal, oldest first. The
+    /// caller writes them before taking the next paste, so no paste precedes
+    /// its journal line. Works after the session stopped too.
+    pub fn take_unjournaled(&self) -> Vec<(u64, u64, String)> {
+        let mut s = lock(&self.inner);
+        let generation = s.snapshot.generation;
+        s.pending
+            .iter_mut()
+            .filter(|p| !p.journaled)
+            .filter_map(|p| {
+                let text = p.text.clone().filter(|text| !text.trim().is_empty())?;
+                p.journaled = true;
+                Some((generation, p.phrase, text))
+            })
+            .collect()
+    }
+
+    /// Speech recognised but never finalised when the session stopped:
+    /// committed phrases still decoding plus the phrase being captured.
+    pub fn unfinished_text(&self) -> String {
+        let s = lock(&self.inner);
+        let mut parts: Vec<String> = s
+            .pending
+            .iter()
+            .filter(|p| p.text.is_none())
+            .map(|p| format!("{}{}", p.preview.0, p.preview.1))
+            .collect();
+        parts.push(format!("{}{}", s.input_text.0, s.input_text.1));
+        let text = parts
+            .iter()
+            .map(|part| part.trim())
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if meaningful_chars(&text) >= MIN_PHRASE_CHARS {
+            text
+        } else {
+            String::new()
         }
     }
 
@@ -1395,6 +1439,28 @@ mod tests {
         assert!(q.take_paste().is_none());
         // Its trailing silence already covers the Enter delay.
         assert!(q.take_submit().is_some());
+    }
+
+    #[test]
+    fn voice_journal_gets_each_final_once_before_its_paste_and_unfinished_text_at_stop() {
+        let q = queue();
+        q.feed(&[1.]);
+        automatic_commit(&q, "A");
+        assert!(q.take_unjournaled().is_empty());
+        q.finalized(7, 1, "первая".into());
+        assert_eq!(q.take_unjournaled(), [(7, 1, "первая".to_string())]);
+        assert!(q.take_unjournaled().is_empty());
+        // Dropped noise is never journaled.
+        q.speech_activity(true);
+        q.feed(&[1.]);
+        silence(&q, SILENCE_SAMPLES);
+        boundary(&q, "A");
+        q.finalized(7, 2, "Б".into());
+        assert!(q.take_unjournaled().is_empty());
+        q.partial(7, 3, "недосказанная".into(), " мысль".into());
+        q.cancel_keeping_draft();
+        assert_eq!(q.unfinished_text(), "недосказанная мысль");
+        assert_eq!(queue().unfinished_text(), "");
     }
 
     #[test]

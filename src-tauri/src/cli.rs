@@ -24,6 +24,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub toggle_voice_mode: bool,
 
+    /// Copy dictated text that was never inserted to the clipboard (sent to running instance)
+    #[arg(long)]
+    pub copy_voice_text: bool,
+
     /// Cancel the current operation (sent to running instance)
     #[arg(long)]
     pub cancel: bool,

@@ -1,5 +1,6 @@
 mod bar_state;
 mod desktop;
+mod journal;
 pub mod state;
 
 use crate::managers::{
@@ -8,9 +9,10 @@ use crate::managers::{
 };
 use bar_state::BarState;
 use desktop::DesktopBridge;
+use journal::{Journal, Waiting};
 use state::{lock, BoundaryMarker, Snapshot, Status, VoiceQueue, COMMIT_TIMEOUT};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -30,6 +32,11 @@ pub struct VoiceSessionManager {
     /// Set on Hyprland only: state goes to the Omarchy bar instead of the
     /// floating panel. Unset (KDE) leaves the panel exactly as it was.
     bar: OnceLock<BarState>,
+    /// Every dictated phrase, on disk before its paste (both desktops).
+    journal: Option<Journal>,
+    /// One rescue notification per stretch of unsaved text.
+    notified: AtomicBool,
+    me: Weak<Self>,
 }
 
 impl VoiceSessionManager {
@@ -38,7 +45,12 @@ impl VoiceSessionManager {
         audio: Arc<AudioRecordingManager>,
         transcription: Arc<TranscriptionManager>,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        let journal = crate::portable::app_data_dir(&app)
+            .map_err(|error| error.to_string())
+            .and_then(|directory| Journal::open(&directory).map_err(|error| error.to_string()))
+            .inspect_err(|error| log::error!("Voice journal unavailable: {error}"))
+            .ok();
+        Arc::new_cyclic(|me| Self {
             app,
             audio,
             transcription,
@@ -47,6 +59,9 @@ impl VoiceSessionManager {
             generation: AtomicU64::new(0),
             busy: AtomicBool::new(false),
             bar: OnceLock::new(),
+            journal,
+            notified: AtomicBool::new(false),
+            me: me.clone(),
         })
     }
 
@@ -71,8 +86,9 @@ impl VoiceSessionManager {
                 Ok(bridge) => {
                     if bridge.bar_indicator() {
                         if let Some(bar) = BarState::new() {
-                            bar.show(None, String::new);
                             let _ = manager.bar.set(bar);
+                            // Also offers text an earlier run could not insert.
+                            manager.refresh_bar(None);
                         }
                     }
                     *lock(&manager.desktop) = Some(bridge);
@@ -174,8 +190,11 @@ impl VoiceSessionManager {
         let mut previous_revision = u64::MAX;
         let mut committing_since: Option<(u64, Instant)> = None;
         let mut last_paste = Instant::now();
+        // Journaled phrases of this session still waiting for an outcome.
+        let mut in_flight = Vec::new();
         while queue.active() {
             self.commit_silence(&queue);
+            self.journal_finals(&queue, &mut in_flight);
             let snapshot = queue.snapshot();
             if snapshot.revision != previous_revision {
                 self.publish(&queue);
@@ -219,6 +238,12 @@ impl VoiceSessionManager {
                     if result.is_ok() {
                         last_paste = Instant::now();
                     }
+                    self.journal_outcome(
+                        request.generation,
+                        request.phrase,
+                        &result,
+                        &mut in_flight,
+                    );
                     queue.paste_done(request.generation, request.phrase, result);
                 }
             }
@@ -241,6 +266,7 @@ impl VoiceSessionManager {
         if let Some(bridge) = &bridge {
             bridge.disable();
         }
+        self.journal_leftovers(&queue, generation, &mut in_flight);
         if captured {
             self.audio.cancel_recording();
         }
@@ -257,11 +283,7 @@ impl VoiceSessionManager {
     fn publish(&self, queue: &VoiceQueue) {
         let snapshot = queue.snapshot();
         let _ = self.app.emit("voice-session-state", &snapshot);
-        if let Some(bar) = self.bar.get() {
-            bar.show(Some(&snapshot), || {
-                crate::settings::get_settings(&self.app).app_language
-            });
-        }
+        self.refresh_bar(Some(&snapshot));
         if snapshot.status == Status::Off {
             crate::overlay::hide_voice_overlay(&self.app);
         }
@@ -304,6 +326,148 @@ impl VoiceSessionManager {
                 }
             }
         });
+    }
+
+    /// Every final phrase not yet on disk is written (fsync) now, before the
+    /// loop can take its paste.
+    fn journal_finals(&self, queue: &VoiceQueue, in_flight: &mut Vec<String>) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        for (generation, phrase, text) in queue.take_unjournaled() {
+            let id = journal.id(generation, phrase);
+            match journal.phrase(&id, &text) {
+                Ok(()) => in_flight.push(id),
+                Err(error) => log::error!("Voice phrase {phrase} not journaled: {error}"),
+            }
+        }
+    }
+
+    fn journal_outcome(
+        &self,
+        generation: u64,
+        phrase: u64,
+        result: &Result<(), String>,
+        in_flight: &mut Vec<String>,
+    ) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        let id = journal.id(generation, phrase);
+        let before = in_flight.len();
+        in_flight.retain(|pending| pending != &id);
+        if in_flight.len() == before {
+            return;
+        }
+        let written = match result {
+            Ok(()) => journal.delivered(&id),
+            Err(reason) => journal.failed(&id, reason),
+        };
+        if let Err(error) = written {
+            log::error!("Voice phrase {phrase} outcome not journaled: {error}");
+        }
+    }
+
+    /// When a session ends nothing dictated may live only in memory: finals
+    /// that never reached a paste, speech still being decoded, and phrases
+    /// whose paste never reported back are kept as failed.
+    fn journal_leftovers(&self, queue: &VoiceQueue, generation: u64, in_flight: &mut Vec<String>) {
+        let Some(journal) = &self.journal else {
+            return;
+        };
+        self.journal_finals(queue, in_flight);
+        let unfinished = queue.unfinished_text();
+        if !unfinished.is_empty() {
+            // Phrase numbers start at 1, so 0 cannot collide.
+            let id = journal.id(generation, 0);
+            match journal.phrase(&id, &unfinished) {
+                Ok(()) => in_flight.push(id),
+                Err(error) => log::error!("Voice unfinished text not journaled: {error}"),
+            }
+        }
+        let reason = queue
+            .snapshot()
+            .error
+            .unwrap_or_else(|| "cancelled".to_string());
+        for id in in_flight.drain(..) {
+            if let Err(error) = journal.failed(&id, &reason) {
+                log::error!("Voice phrase outcome not journaled: {error}");
+            }
+        }
+    }
+
+    /// Hyprland: bar icon from the session and the journal; the first time
+    /// unsaved text shows up, one notification offers to copy it.
+    fn refresh_bar(&self, snapshot: Option<&Snapshot>) {
+        let Some(bar) = self.bar.get() else {
+            return;
+        };
+        let waiting = self
+            .journal
+            .as_ref()
+            .map(Journal::waiting)
+            .unwrap_or_default();
+        bar.show(snapshot, &waiting, || {
+            crate::settings::get_settings(&self.app).app_language
+        });
+        if waiting.is_empty() {
+            self.notified.store(false, Ordering::Release);
+        } else if !self.notified.swap(true, Ordering::AcqRel) {
+            self.notify_waiting(&waiting);
+        }
+    }
+
+    fn notify_waiting(&self, waiting: &[Waiting]) {
+        let language = crate::settings::get_settings(&self.app).app_language;
+        let Some((summary, body, action)) = bar_state::notice(&language, waiting) else {
+            return;
+        };
+        let me = self.me.clone();
+        std::thread::spawn(move || {
+            // --wait: notify-send prints the action key once it is clicked.
+            let output = std::process::Command::new("notify-send")
+                .arg("--app-name=Diktor")
+                .arg("--icon=audio-input-microphone")
+                .arg("--wait")
+                .arg(format!("--action=copy={action}"))
+                .arg(summary)
+                .arg(body)
+                .output();
+            match output {
+                Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "copy" => {
+                    if let Some(manager) = me.upgrade() {
+                        let result = manager.copy_waiting_text();
+                        log::info!("Voice text copied from notification: {result:?}");
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("Voice rescue notification not shown: {error}"),
+            }
+        });
+    }
+
+    /// All text waiting in the journal, oldest first, through the helper's
+    /// copy (the overlay's "Copy draft" path); then it is marked copied.
+    pub fn copy_waiting_text(&self) -> Result<usize, String> {
+        let journal = self.journal.as_ref().ok_or("desktop")?;
+        let waiting = journal.waiting();
+        if waiting.is_empty() {
+            return Err("cancelled".into());
+        }
+        let text = waiting
+            .iter()
+            .map(|entry| entry.text.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let bridge = lock(&self.desktop).clone().ok_or("desktop")?;
+        bridge.request(serde_json::json!({"op": "copy", "text": text}))?;
+        let ids: Vec<String> = waiting.iter().map(|entry| entry.id.clone()).collect();
+        journal.copied(&ids).map_err(|error| {
+            log::error!("Voice copy not journaled: {error}");
+            "desktop".to_string()
+        })?;
+        self.refresh_bar(self.snapshot().as_ref());
+        Ok(waiting.len())
     }
 
     /// Toggle off: unpasted text survives as a copyable draft.

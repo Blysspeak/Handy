@@ -3,8 +3,9 @@
 // to bar.layout in ~/.config/omarchy/shell.json.
 //
 // State comes from $XDG_RUNTIME_DIR/diktor/voice-state.json, which Diktor
-// replaces atomically (voice_session/bar_state.rs): {state, tooltip, draft}.
-// Left click toggles voice mode; right click copies an unsent draft.
+// replaces atomically (voice_session/bar_state.rs): {state, tooltip}.
+// Left click toggles voice mode, or copies text that was never inserted while
+// some is waiting (voice-journal.jsonl); middle click always toggles.
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -18,10 +19,11 @@ Item {
   property string moduleName
   property var settings
 
-  // "off" | "listening" | "speech" | "sending" | "error"; `state` is taken by Item.
+  // "off" | "listening" | "speech" | "sending" | "error" | "waiting";
+  // `state` is taken by Item.
   property string voiceState: "off"
   property string tooltip: ""
-  property string draft: ""
+  readonly property string handy: "\"$HOME/.local/bin/handy\""
 
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
@@ -31,7 +33,6 @@ Item {
     try { data = JSON.parse(raw) } catch (e) {}
     voiceState = String(data.state || "off")
     tooltip = String(data.tooltip || "")
-    draft = String(data.draft || "")
   }
 
   FileView {
@@ -59,15 +60,16 @@ Item {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "󰍬"
+    // Unsaved text gets its own glyph (copy); every other state is the mic.
+    text: root.voiceState === "waiting" ? "󰆏" : "󰍬"
     dimmed: root.voiceState === "off"
-    active: root.voiceState === "speech" || root.voiceState === "sending" || root.voiceState === "error"
-    activeColor: root.voiceState === "error" ? Color.urgent : Color.accent
+    active: ["speech", "sending", "error", "waiting"].indexOf(root.voiceState) >= 0
+    activeColor: root.voiceState === "error" || root.voiceState === "waiting" ? Color.urgent : Color.accent
     tooltipText: root.tooltip ? "Diktor\n" + root.tooltip : "Diktor"
     onPressed: function(b) {
       if (!root.bar) return
-      if (b === Qt.LeftButton) root.bar.run("\"$HOME/.local/bin/handy\" --toggle-voice-mode")
-      else if (b === Qt.RightButton && root.draft) root.bar.run("wl-copy -- " + root.bar.shellQuote(root.draft))
+      if (b === Qt.LeftButton && root.voiceState === "waiting") root.bar.run(root.handy + " --copy-voice-text")
+      else if (b === Qt.LeftButton || b === Qt.MiddleButton) root.bar.run(root.handy + " --toggle-voice-mode")
     }
   }
 
