@@ -19,6 +19,31 @@ use tauri::{AppHandle, Emitter};
 /// A terminal may still be reading the bracketed paste when Enter arrives.
 const MIN_PASTE_TO_ENTER: Duration = Duration::from_millis(300);
 
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let text = state::sanitize(text);
+    for selection in [None, Some("--primary")] {
+        let mut child = std::process::Command::new("wl-copy")
+            .args(selection)
+            .args(["--type", "text/plain;charset=utf-8"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| format!("wl-copy: {error}"))?;
+        let mut input = child.stdin.take().ok_or("wl-copy: no stdin")?;
+        input
+            .write_all(text.as_bytes())
+            .map_err(|error| format!("wl-copy: {error}"))?;
+        drop(input);
+        // wl-copy forks a server that owns the selection; the parent exits.
+        let status = child.wait().map_err(|error| format!("wl-copy: {error}"))?;
+        if !status.success() {
+            return Err(format!("wl-copy: {status}"));
+        }
+    }
+    Ok(())
+}
+
 /// Owns persistent voice lifecycle. Model work and desktop IPC never run on the
 /// UI/audio thread; stopping invalidates permission to paste synchronously.
 pub struct VoiceSessionManager {
@@ -444,8 +469,10 @@ impl VoiceSessionManager {
         });
     }
 
-    /// All text waiting in the journal, oldest first, through the helper's
-    /// copy (the overlay's "Copy draft" path); then it is marked copied.
+    /// All text waiting in the journal, oldest first, to the clipboard and
+    /// primary selection; then it is marked copied. Direct wl-copy with the
+    /// helper's own arguments, not the helper: rescue must work after the
+    /// helper died, which is one of the ways text ends up waiting.
     pub fn copy_waiting_text(&self) -> Result<usize, String> {
         let journal = self.journal.as_ref().ok_or("desktop")?;
         let waiting = journal.waiting().map_err(|error| {
@@ -460,8 +487,7 @@ impl VoiceSessionManager {
             .map(|entry| entry.text.trim())
             .collect::<Vec<_>>()
             .join(" ");
-        let bridge = lock(&self.desktop).clone().ok_or("desktop")?;
-        bridge.request(serde_json::json!({"op": "copy", "text": text}))?;
+        copy_to_clipboard(&text)?;
         let ids: Vec<String> = waiting.iter().map(|entry| entry.id.clone()).collect();
         journal.copied(&ids).map_err(|error| {
             log::error!("Voice copy not journaled: {error}");
