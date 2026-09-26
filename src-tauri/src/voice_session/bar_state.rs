@@ -29,10 +29,6 @@ static VOICE_TEXT: Lazy<Vec<(&'static str, Value)>> = Lazy::new(|| {
     .collect()
 });
 
-/// Waiting phrases listed in the tooltip, newest last, and their preview length.
-const TOOLTIP_PHRASES: usize = 3;
-const PREVIEW_CHARS: usize = 80;
-
 fn voice_text(language: &str, pointer: &str) -> String {
     let language = language.split(['-', '_']).next().unwrap_or("en");
     [language, "en"]
@@ -47,6 +43,9 @@ fn voice_text(language: &str, pointer: &str) -> String {
 /// Translation pointer for a refusal/stop code; unknown codes read as
 /// "model", like the overlay.
 fn error_pointer(code: &str) -> String {
+    if code == "interrupted" {
+        return "/errors/interrupted".into();
+    }
     let pointer = format!("/errors/{code}");
     if voice_text("en", &pointer).is_empty() {
         "/errors/model".into()
@@ -55,24 +54,17 @@ fn error_pointer(code: &str) -> String {
     }
 }
 
-fn preview(text: &str) -> String {
-    let text = text.trim();
-    let mut preview: String = text.chars().take(PREVIEW_CHARS).collect();
-    if text.chars().count() > PREVIEW_CHARS {
-        preview.push('…');
-    }
-    preview
-}
-
 /// What the bar shows. Comparing this, not the snapshot, skips countdown ticks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Shown {
     state: &'static str,
     message: Option<String>,
-    waiting: Vec<Waiting>,
+    rescue: Vec<Waiting>,
 }
 
-fn shown(snapshot: Option<&Snapshot>, waiting: &[Waiting]) -> Shown {
+/// The icon is the live voice state only; text that was not inserted goes
+/// to the rescue popup and never changes what the icon or a click means.
+fn shown(snapshot: Option<&Snapshot>, rescue: &[Waiting]) -> Shown {
     let (state, message) = match snapshot.map(|s| (s.status, s.speech_active, s.error.as_deref())) {
         None | Some((Status::Off, ..)) => ("off", None),
         Some((Status::Stopping, ..)) => ("off", Some("/stopping".to_string())),
@@ -80,75 +72,64 @@ fn shown(snapshot: Option<&Snapshot>, waiting: &[Waiting]) -> Shown {
         Some((Status::Listening, true, _)) => ("speech", Some("/speech".to_string())),
         Some((Status::Listening, false, _)) => ("listening", Some("/listening".to_string())),
         Some((Status::Committing, ..)) => ("sending", Some("/committing".to_string())),
-        // A refused paste keeps listening; its text is rescued from the journal.
+        // A refused paste keeps listening; its text is in the rescue popup.
         Some((Status::Draft, ..)) => ("listening", Some("/listening".to_string())),
         Some((Status::Error, _, error)) => ("error", Some(error_pointer(error.unwrap_or("model")))),
     };
     Shown {
-        // Unsaved text outranks everything: the click must rescue it.
-        state: if waiting.is_empty() { state } else { "waiting" },
+        state,
         message,
-        waiting: waiting.to_vec(),
+        rescue: rescue.to_vec(),
     }
+}
+
+/// The popup the bar widget draws while text waits to be rescued.
+#[derive(Serialize)]
+struct RescueFile {
+    /// Newest phrase id: a new failure reopens a popup the bar had hidden.
+    id: String,
+    count: usize,
+    title: String,
+    reason: String,
+    /// Every phrase the popup rescues, oldest first; "copy" copies these.
+    text: String,
+    copy: String,
+    close: String,
 }
 
 #[derive(Serialize)]
 struct BarFile<'a> {
     state: &'a str,
     tooltip: String,
+    rescue: Option<RescueFile>,
 }
 
 fn render<'a>(shown: &'a Shown, language: &str) -> BarFile<'a> {
-    let mut lines = Vec::new();
-    if let Some(pointer) = &shown.message {
-        lines.push(voice_text(language, pointer));
-    }
-    if !shown.waiting.is_empty() {
-        let count = voice_text(language, "/barWaiting")
-            .replace("{{count}}", &shown.waiting.len().to_string());
-        let skip = shown.waiting.len().saturating_sub(TOOLTIP_PHRASES);
-        let mut block = vec![count];
-        block.extend(
-            shown.waiting[skip..]
-                .iter()
-                .map(|w| format!("«{}»", preview(&w.text))),
-        );
-        lines.push(block.join("\n"));
-        lines.push(voice_text(language, "/barWaitingHint"));
-    }
+    let tooltip = shown
+        .message
+        .as_deref()
+        .map(|pointer| voice_text(language, pointer))
+        .unwrap_or_default();
+    let rescue = shown.rescue.last().map(|newest| RescueFile {
+        id: newest.id.clone(),
+        count: shown.rescue.len(),
+        title: voice_text(language, "/barWaiting")
+            .replace("{{count}}", &shown.rescue.len().to_string()),
+        reason: voice_text(language, &error_pointer(&newest.reason)),
+        text: shown
+            .rescue
+            .iter()
+            .map(|w| w.text.trim())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        copy: voice_text(language, "/rescueCopy"),
+        close: voice_text(language, "/rescueClose"),
+    });
     BarFile {
         state: shown.state,
-        tooltip: lines.join("\n\n"),
+        tooltip,
+        rescue,
     }
-}
-
-/// Desktop notification for text that could not be inserted: summary, body
-/// and the copy action's label.
-pub fn notice(language: &str, waiting: &[Waiting]) -> Option<(String, String, String)> {
-    let newest = waiting.last()?;
-    let reason = if newest.reason == "interrupted" {
-        "/errors/interrupted".to_string()
-    } else {
-        error_pointer(&newest.reason)
-    };
-    let count =
-        voice_text(language, "/barWaiting").replace("{{count}}", &waiting.len().to_string());
-    // The daemon renders body markup; dictated "<" or "&" must stay text.
-    let escape = |text: &str| {
-        text.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
-    Some((
-        format!("Diktor · {count}"),
-        // The popup shows two lines: the text first, then why it is waiting.
-        escape(&format!(
-            "«{}»\n{}",
-            preview(&newest.text),
-            voice_text(language, &reason)
-        )),
-        voice_text(language, "/copy"),
-    ))
 }
 
 pub struct BarState {
@@ -173,10 +154,10 @@ impl BarState {
     pub fn show(
         &self,
         snapshot: Option<&Snapshot>,
-        waiting: &[Waiting],
+        rescue: &[Waiting],
         language: impl FnOnce() -> String,
     ) {
-        let shown = shown(snapshot, waiting);
+        let shown = shown(snapshot, rescue);
         let mut last = lock(&self.last);
         if last.as_ref() == Some(&shown) {
             return;
@@ -236,37 +217,39 @@ mod tests {
     }
 
     #[test]
-    fn voice_bar_states_follow_the_overlay_tones() {
-        let state = |status, speech| shown(Some(&snapshot(status, speech, None)), &[]).state;
-        assert_eq!(shown(None, &[]).state, "off");
-        assert_eq!(state(Status::Off, false), "off");
-        assert_eq!(state(Status::Stopping, false), "off");
-        assert_eq!(state(Status::Loading, false), "listening");
-        assert_eq!(state(Status::Listening, false), "listening");
-        assert_eq!(state(Status::Listening, true), "speech");
-        assert_eq!(state(Status::Committing, false), "sending");
-        assert_eq!(state(Status::Draft, false), "listening");
-        assert_eq!(state(Status::Error, false), "error");
+    fn voice_bar_icon_is_the_live_state_even_while_text_waits() {
+        let pending = waiting(&["не вставилось"]);
+        for rescue in [&[][..], &pending[..]] {
+            let state = |status, speech| shown(Some(&snapshot(status, speech, None)), rescue).state;
+            assert_eq!(shown(None, rescue).state, "off");
+            assert_eq!(state(Status::Off, false), "off");
+            assert_eq!(state(Status::Stopping, false), "off");
+            assert_eq!(state(Status::Loading, false), "listening");
+            assert_eq!(state(Status::Listening, false), "listening");
+            assert_eq!(state(Status::Listening, true), "speech");
+            assert_eq!(state(Status::Committing, false), "sending");
+            assert_eq!(state(Status::Draft, false), "listening");
+            assert_eq!(state(Status::Error, false), "error");
+        }
     }
 
     #[test]
-    fn voice_bar_waiting_text_outranks_every_state_and_lists_the_newest() {
-        let texts = ["первая", "вторая", "третья", &"д".repeat(PREVIEW_CHARS + 3)];
-        for status in [Status::Off, Status::Listening, Status::Error] {
-            assert_eq!(
-                shown(Some(&snapshot(status, false, None)), &waiting(&texts)).state,
-                "waiting"
-            );
-        }
-        let all = shown(None, &waiting(&texts));
+    fn voice_bar_rescue_popup_carries_every_waiting_phrase_and_the_newest_reason() {
+        assert!(render(&shown(None, &[]), "ru").rescue.is_none());
+        let mut list = waiting(&["первая", "вторая"]);
+        list[1].reason = "interrupted".into();
+        let all = shown(Some(&snapshot(Status::Listening, true, None)), &list);
         let file = render(&all, "ru");
-        assert!(file.tooltip.starts_with("Не вставлено: 4"));
-        assert!(!file.tooltip.contains("первая"));
-        assert!(file.tooltip.contains("«вторая»"));
-        assert!(file
-            .tooltip
-            .contains(&format!("«{}…»", "д".repeat(PREVIEW_CHARS))));
-        assert!(file.tooltip.ends_with(&voice_text("ru", "/barWaitingHint")));
+        assert_eq!(file.state, "speech");
+        assert_eq!(file.tooltip, "Слышу речь…");
+        let rescue = file.rescue.unwrap();
+        assert_eq!(rescue.id, "run-1-1");
+        assert_eq!(rescue.count, 2);
+        assert_eq!(rescue.title, "Не вставлено: 2");
+        assert_eq!(rescue.reason, voice_text("ru", "/errors/interrupted"));
+        assert_eq!(rescue.text, "первая\n\nвторая");
+        assert_eq!(rescue.copy, "Скопировать");
+        assert_eq!(rescue.close, "Закрыть");
     }
 
     #[test]
@@ -284,26 +267,6 @@ mod tests {
         let unknown = shown(Some(&snapshot(Status::Error, false, Some("weird"))), &[]);
         assert_eq!(unknown.message.as_deref(), Some("/errors/model"));
         assert_eq!(render(&shown(None, &[]), "ru").tooltip, "");
-    }
-
-    #[test]
-    fn voice_bar_notice_names_the_reason_and_quotes_the_newest_text() {
-        assert!(notice("ru", &[]).is_none());
-        let mut list = waiting(&["первая", "вторая"]);
-        let (summary, body, action) = notice("ru", &list).unwrap();
-        assert_eq!(summary, "Diktor · Не вставлено: 2");
-        assert!(body.starts_with("«вторая»\nВернитесь в выбранное окно"));
-        assert_eq!(action, voice_text("ru", "/copy"));
-        list[1].text = "a <b> & c".into();
-        assert!(notice("ru", &list)
-            .unwrap()
-            .1
-            .starts_with("«a &lt;b&gt; &amp; c»"));
-        list[1].reason = "interrupted".into();
-        assert!(notice("ru", &list)
-            .unwrap()
-            .1
-            .ends_with(&voice_text("ru", "/errors/interrupted")));
     }
 
     #[test]
@@ -329,10 +292,13 @@ mod tests {
         let read =
             || -> Value { serde_json::from_slice(&std::fs::read(&bar.path).unwrap()).unwrap() };
         assert_eq!(read()["state"], "listening");
+        assert!(read()["rescue"].is_null());
         bar.show(Some(&listening), &waiting(&["текст"]), || "ru".into());
-        assert_eq!(read()["state"], "waiting");
+        assert_eq!(read()["state"], "listening");
+        assert_eq!(read()["rescue"]["text"], "текст");
         bar.show(None, &[], || "ru".into());
         assert_eq!(read()["state"], "off");
+        assert!(read()["rescue"].is_null());
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -881,6 +881,10 @@ pub fn run(cli_args: CliArgs) {
                 if let Some(manager) = app.try_state::<Arc<VoiceSessionManager>>() {
                     manager.toggle();
                 }
+            } else if args.iter().any(|a| a == "--dismiss-voice-rescue") {
+                if let Some(manager) = app.try_state::<Arc<VoiceSessionManager>>() {
+                    manager.dismiss_voice_rescue();
+                }
             } else if args.iter().any(|a| a == "--copy-voice-text") {
                 if let Some(manager) = app.try_state::<Arc<VoiceSessionManager>>() {
                     let result = manager.copy_waiting_text();

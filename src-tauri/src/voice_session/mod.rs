@@ -11,8 +11,9 @@ use bar_state::BarState;
 use desktop::DesktopBridge;
 use journal::{Journal, Waiting};
 use state::{lock, BoundaryMarker, Snapshot, Status, VoiceQueue, COMMIT_TIMEOUT};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -59,9 +60,10 @@ pub struct VoiceSessionManager {
     bar: OnceLock<BarState>,
     /// Every dictated phrase, on disk before its paste (both desktops).
     journal: Option<Journal>,
-    /// One rescue notification per stretch of unsaved text.
-    notified: AtomicBool,
-    me: Weak<Self>,
+    /// Waiting phrases the owner closed the rescue popup on (or that were
+    /// shown when voice mode was toggled). Hidden only: they stay in the
+    /// journal and come back after a restart.
+    rescue_hidden: Mutex<HashSet<String>>,
 }
 
 impl VoiceSessionManager {
@@ -75,7 +77,7 @@ impl VoiceSessionManager {
             .and_then(|directory| Journal::open(&directory).map_err(|error| error.to_string()))
             .inspect_err(|error| log::error!("Voice journal unavailable: {error}"))
             .ok();
-        Arc::new_cyclic(|me| Self {
+        Arc::new(Self {
             app,
             audio,
             transcription,
@@ -85,8 +87,7 @@ impl VoiceSessionManager {
             busy: AtomicBool::new(false),
             bar: OnceLock::new(),
             journal,
-            notified: AtomicBool::new(false),
-            me: me.clone(),
+            rescue_hidden: Mutex::new(HashSet::new()),
         })
     }
 
@@ -132,6 +133,8 @@ impl VoiceSessionManager {
     }
 
     pub fn toggle(self: &Arc<Self>) {
+        // Toggling either way closes the rescue popup.
+        self.dismiss_voice_rescue();
         if self.busy.load(Ordering::Acquire) {
             self.stop();
             return;
@@ -416,87 +419,74 @@ impl VoiceSessionManager {
         }
     }
 
-    /// Hyprland: bar icon from the session and the journal; the first time
-    /// unsaved text shows up, one notification offers to copy it.
-    fn refresh_bar(&self, snapshot: Option<&Snapshot>) {
-        let Some(bar) = self.bar.get() else {
-            return;
-        };
-        let waiting = match self.journal.as_ref().map(Journal::waiting) {
+    fn waiting(&self) -> Vec<Waiting> {
+        match self.journal.as_ref().map(Journal::waiting) {
             Some(Ok(waiting)) => waiting,
             Some(Err(error)) => {
                 log::error!("Voice journal not readable: {error}");
                 Vec::new()
             }
             None => Vec::new(),
-        };
-        bar.show(snapshot, &waiting, || {
-            crate::settings::get_settings(&self.app).app_language
-        });
-        if waiting.is_empty() {
-            self.notified.store(false, Ordering::Release);
-        } else if !self.notified.swap(true, Ordering::AcqRel) {
-            self.notify_waiting(&waiting);
         }
     }
 
-    fn notify_waiting(&self, waiting: &[Waiting]) {
-        let language = crate::settings::get_settings(&self.app).app_language;
-        let Some((summary, body, action)) = bar_state::notice(&language, waiting) else {
+    /// Waiting phrases the rescue popup shows: all not hidden by the owner.
+    fn rescue(&self) -> Vec<Waiting> {
+        let hidden = lock(&self.rescue_hidden);
+        self.waiting()
+            .into_iter()
+            .filter(|entry| !hidden.contains(&entry.id))
+            .collect()
+    }
+
+    /// Hyprland: the bar icon follows the session, the popup the journal.
+    fn refresh_bar(&self, snapshot: Option<&Snapshot>) {
+        let Some(bar) = self.bar.get() else {
             return;
         };
-        let me = self.me.clone();
-        std::thread::spawn(move || {
-            // --wait: notify-send prints the action key once it is invoked.
-            // The Omarchy popup draws no buttons; a click on it invokes the
-            // action named "default", so the copy must be that action.
-            let output = std::process::Command::new("notify-send")
-                .arg("--app-name=Diktor")
-                .arg("--icon=audio-input-microphone")
-                .arg("--wait")
-                .arg(format!("--action=default={action}"))
-                .arg(summary)
-                .arg(body)
-                .output();
-            match output {
-                Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "default" => {
-                    if let Some(manager) = me.upgrade() {
-                        let result = manager.copy_waiting_text();
-                        log::info!("Voice text copied from notification: {result:?}");
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => log::warn!("Voice rescue notification not shown: {error}"),
-            }
+        bar.show(snapshot, &self.rescue(), || {
+            crate::settings::get_settings(&self.app).app_language
         });
     }
 
-    /// All text waiting in the journal, oldest first, to the clipboard and
-    /// primary selection; then it is marked copied. Direct wl-copy with the
-    /// helper's own arguments, not the helper: rescue must work after the
-    /// helper died, which is one of the ways text ends up waiting.
+    /// Closes the rescue popup; its phrases stay in the journal.
+    pub fn dismiss_voice_rescue(&self) {
+        let rescue = self.rescue();
+        if rescue.is_empty() {
+            return;
+        }
+        lock(&self.rescue_hidden).extend(rescue.into_iter().map(|entry| entry.id));
+        self.refresh_bar(self.snapshot().as_ref());
+    }
+
+    /// The rescue popup's phrases (all waiting ones when it is closed),
+    /// oldest first, to the clipboard and primary selection; then they are
+    /// marked copied. Direct wl-copy with the helper's own arguments, not the
+    /// helper: rescue must work after the helper died, which is one of the
+    /// ways text ends up waiting.
     pub fn copy_waiting_text(&self) -> Result<usize, String> {
         let journal = self.journal.as_ref().ok_or("desktop")?;
-        let waiting = journal.waiting().map_err(|error| {
-            log::error!("Voice journal not readable: {error}");
-            "desktop".to_string()
-        })?;
-        if waiting.is_empty() {
+        let mut phrases = self.rescue();
+        if phrases.is_empty() {
+            phrases = self.waiting();
+        }
+        if phrases.is_empty() {
             return Err("cancelled".into());
         }
-        let text = waiting
+        // Spaces, not line breaks: a newline pasted into a chat would send it.
+        let text = phrases
             .iter()
             .map(|entry| entry.text.trim())
             .collect::<Vec<_>>()
             .join(" ");
         copy_to_clipboard(&text)?;
-        let ids: Vec<String> = waiting.iter().map(|entry| entry.id.clone()).collect();
+        let ids: Vec<String> = phrases.iter().map(|entry| entry.id.clone()).collect();
         journal.copied(&ids).map_err(|error| {
             log::error!("Voice copy not journaled: {error}");
             "desktop".to_string()
         })?;
         self.refresh_bar(self.snapshot().as_ref());
-        Ok(waiting.len())
+        Ok(phrases.len())
     }
 
     /// Toggle off: unpasted text survives as a copyable draft.

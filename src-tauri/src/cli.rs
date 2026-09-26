@@ -28,6 +28,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub copy_voice_text: bool,
 
+    /// Close the voice rescue popup; its text stays saved (sent to running instance)
+    #[arg(long)]
+    pub dismiss_voice_rescue: bool,
+
     /// Cancel the current operation (sent to running instance)
     #[arg(long)]
     pub cancel: bool,

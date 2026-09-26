@@ -3,11 +3,13 @@
 // to bar.layout in ~/.config/omarchy/shell.json.
 //
 // State comes from $XDG_RUNTIME_DIR/diktor/voice-state.json, which Diktor
-// replaces atomically (voice_session/bar_state.rs): {state, tooltip}.
-// Left click toggles voice mode, or copies text that was never inserted while
-// some is waiting (voice_phrases in history.db); right click copies it at any
-// time, middle click always toggles.
+// replaces atomically (voice_session/bar_state.rs):
+//   {state, tooltip, rescue: null | {id, count, title, reason, text, copy, close}}
+// The icon is only the live voice state. Left click toggles voice mode, right
+// click copies text that was never inserted. While `rescue` is set, a popup
+// shows that text with Copy / Close; the phrases stay in history.db either way.
 import QtQuick
+import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -20,10 +22,12 @@ Item {
   property string moduleName
   property var settings
 
-  // "off" | "listening" | "speech" | "sending" | "error" | "waiting";
-  // `state` is taken by Item.
+  // "off" | "listening" | "speech" | "sending" | "error"; `state` is taken by Item.
   property string voiceState: "off"
   property string tooltip: ""
+  property var rescue: null
+  // Hidden locally when another bar popup takes over; a new failure (new id) reopens it.
+  property string hiddenRescueId: ""
   readonly property string handy: "\"$HOME/.local/bin/handy\""
 
   implicitWidth: button.implicitWidth
@@ -34,6 +38,16 @@ Item {
     try { data = JSON.parse(raw) } catch (e) {}
     voiceState = String(data.state || "off")
     tooltip = String(data.tooltip || "")
+    rescue = data.rescue && data.rescue.text ? data.rescue : null
+  }
+
+  // Called by the bar's one-popup-at-a-time coordinator.
+  function close() {
+    if (rescue) hiddenRescueId = rescue.id
+  }
+
+  function run(flag) {
+    if (root.bar) root.bar.run(root.handy + " " + flag)
   }
 
   FileView {
@@ -61,18 +75,14 @@ Item {
     id: button
     anchors.fill: parent
     bar: root.bar
-    // Unsaved text gets its own glyph (copy); every other state is the mic.
-    text: root.voiceState === "waiting" ? "󰆏" : "󰍬"
+    text: "󰍬"
     dimmed: root.voiceState === "off"
-    active: ["speech", "sending", "error", "waiting"].indexOf(root.voiceState) >= 0
-    activeColor: root.voiceState === "error" || root.voiceState === "waiting" ? Color.urgent : Color.accent
+    active: ["speech", "sending", "error"].indexOf(root.voiceState) >= 0
+    activeColor: root.voiceState === "error" ? Color.urgent : Color.accent
     tooltipText: root.tooltip ? "Diktor\n" + root.tooltip : "Diktor"
     onPressed: function(b) {
-      if (!root.bar) return
-      var waiting = root.voiceState === "waiting"
-      if (b === Qt.RightButton || (b === Qt.LeftButton && waiting)) {
-        if (waiting) root.bar.run(root.handy + " --copy-voice-text")
-      } else root.bar.run(root.handy + " --toggle-voice-mode")
+      if (b === Qt.RightButton) root.run("--copy-voice-text")
+      else if (b === Qt.LeftButton) root.run("--toggle-voice-mode")
     }
   }
 
@@ -83,5 +93,87 @@ Item {
     alwaysRunToEnd: true
     NumberAnimation { to: 0.6; duration: 650; easing.type: Easing.InOutSine }
     NumberAnimation { to: 1; duration: 650; easing.type: Easing.InOutSine }
+  }
+
+  // Text that could not be inserted. "hover" mode: no focus grab, so the
+  // popup never takes keyboard focus from the window voice mode types into.
+  PopupCard {
+    id: popup
+    anchorItem: button
+    bar: root.bar
+    owner: root
+    triggerMode: "hover"
+    open: root.rescue !== null && root.rescue.id !== root.hiddenRescueId
+    contentWidth: Style.space(380)
+    contentHeight: fittedContentHeight(body.implicitHeight, Style.space(360))
+
+    ColumnLayout {
+      id: body
+      anchors.fill: parent
+      spacing: Style.space(8)
+
+      Text {
+        Layout.fillWidth: true
+        text: root.rescue ? root.rescue.title : ""
+        color: Color.urgent
+        font.family: Style.font.family
+        font.pixelSize: Style.font.title
+        font.bold: true
+      }
+
+      Text {
+        Layout.fillWidth: true
+        text: root.rescue ? root.rescue.reason : ""
+        color: Color.popups.text
+        opacity: 0.7
+        wrapMode: Text.Wrap
+        font.family: Style.font.family
+        font.pixelSize: Style.font.bodySmall
+      }
+
+      Flickable {
+        id: scroller
+        Layout.fillWidth: true
+        Layout.fillHeight: true
+        Layout.preferredHeight: Math.min(phrase.implicitHeight, Style.space(200))
+        contentHeight: phrase.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+
+        Text {
+          id: phrase
+          width: scroller.width
+          text: root.rescue ? root.rescue.text : ""
+          color: Color.popups.text
+          wrapMode: Text.Wrap
+          textFormat: Text.PlainText
+          font.family: Style.font.family
+          font.pixelSize: Style.font.body
+        }
+      }
+
+      RowLayout {
+        Layout.alignment: Qt.AlignRight
+        spacing: Style.space(8)
+
+        Button {
+          text: root.rescue ? root.rescue.close : ""
+          bordered: true
+          onClicked: {
+            root.close()
+            root.run("--dismiss-voice-rescue")
+          }
+        }
+
+        Button {
+          text: root.rescue ? root.rescue.copy : ""
+          bordered: true
+          onClicked: {
+            root.close()
+            root.run("--copy-voice-text")
+          }
+        }
+      }
+    }
   }
 }

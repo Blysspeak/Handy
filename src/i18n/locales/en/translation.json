@@ -10,7 +10,8 @@
     "copied": "Copied",
     "copyFailed": "Could not copy",
     "barWaiting": "Not inserted: {{count}}",
-    "barWaitingHint": "Click to copy all of it; middle-click turns voice mode on or off.",
+    "rescueCopy": "Copy",
+    "rescueClose": "Close",
     "errors": {
       "target_changed": "Return to the selected window, or copy the draft.",
       "target_unavailable": "The selected window is unavailable. You can copy the draft.",

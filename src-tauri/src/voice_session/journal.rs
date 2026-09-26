@@ -313,6 +313,23 @@ mod tests {
     }
 
     #[test]
+    fn voice_journal_delivered_phrase_never_waits_even_after_restart() {
+        let path = database("delivered");
+        {
+            let journal = Journal::open_at(&path, 1_000).unwrap();
+            for phrase in 1..=3 {
+                let id = journal.id(5, phrase);
+                journal.phrase(&id, "вставлено", None).unwrap();
+                journal.delivered(&id, Some(&target("0xA"))).unwrap();
+            }
+            assert!(journal.waiting().unwrap().is_empty());
+        }
+        let journal = Journal::open_at(&path, 2_000).unwrap();
+        assert!(journal.waiting().unwrap().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn voice_journal_recovers_failed_and_interrupted_after_restart() {
         let path = database("recover");
         {
