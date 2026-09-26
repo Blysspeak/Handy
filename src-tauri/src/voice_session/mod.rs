@@ -447,17 +447,19 @@ impl VoiceSessionManager {
         };
         let me = self.me.clone();
         std::thread::spawn(move || {
-            // --wait: notify-send prints the action key once it is clicked.
+            // --wait: notify-send prints the action key once it is invoked.
+            // The Omarchy popup draws no buttons; a click on it invokes the
+            // action named "default", so the copy must be that action.
             let output = std::process::Command::new("notify-send")
                 .arg("--app-name=Diktor")
                 .arg("--icon=audio-input-microphone")
                 .arg("--wait")
-                .arg(format!("--action=copy={action}"))
+                .arg(format!("--action=default={action}"))
                 .arg(summary)
                 .arg(body)
                 .output();
             match output {
-                Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "copy" => {
+                Ok(output) if String::from_utf8_lossy(&output.stdout).trim() == "default" => {
                     if let Some(manager) = me.upgrade() {
                         let result = manager.copy_waiting_text();
                         log::info!("Voice text copied from notification: {result:?}");

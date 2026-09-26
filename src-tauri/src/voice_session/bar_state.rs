@@ -141,10 +141,11 @@ pub fn notice(language: &str, waiting: &[Waiting]) -> Option<(String, String, St
     };
     Some((
         format!("Diktor · {count}"),
+        // The popup shows two lines: the text first, then why it is waiting.
         escape(&format!(
-            "{}\n\n«{}»",
-            voice_text(language, &reason),
-            preview(&newest.text)
+            "«{}»\n{}",
+            preview(&newest.text),
+            voice_text(language, &reason)
         )),
         voice_text(language, "/copy"),
     ))
@@ -291,19 +292,18 @@ mod tests {
         let mut list = waiting(&["первая", "вторая"]);
         let (summary, body, action) = notice("ru", &list).unwrap();
         assert_eq!(summary, "Diktor · Не вставлено: 2");
-        assert!(body.starts_with("Вернитесь в выбранное окно"));
-        assert!(body.ends_with("«вторая»"));
+        assert!(body.starts_with("«вторая»\nВернитесь в выбранное окно"));
         assert_eq!(action, voice_text("ru", "/copy"));
         list[1].text = "a <b> & c".into();
         assert!(notice("ru", &list)
             .unwrap()
             .1
-            .ends_with("«a &lt;b&gt; &amp; c»"));
+            .starts_with("«a &lt;b&gt; &amp; c»"));
         list[1].reason = "interrupted".into();
         assert!(notice("ru", &list)
             .unwrap()
             .1
-            .starts_with(&voice_text("ru", "/errors/interrupted")));
+            .ends_with(&voice_text("ru", "/errors/interrupted")));
     }
 
     #[test]
