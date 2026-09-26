@@ -20,22 +20,48 @@ diktor status            # демон, модель, режим, RSS, сколь
 diktor copy [N]          # в буфер: невставленный текст из попапа бара,
                          # или последние N невставленных фраз
 diktor dismiss           # закрыть попап бара (фразы остаются в базе)
+diktor lang ru|en|auto   # язык распознавания, со следующей фразы; сохраняется в конфиг
 diktor devices           # имена микрофонов для input_device
 ```
+
+Словарь и журнал (работают без демона, у каждой команды есть `--json`):
+
+```
+diktor glossary list                          # что как пишется
+diktor glossary add камит commit              # точное слово
+diktor glossary add --stem "икс хаб" xhub     # имя: падежи и приклеенный предлог
+diktor glossary remove камит
+diktor misses [--days 30]                     # латиница/КАПС в распознанном, чего нет в словаре
+diktor phrases recent [--limit 20]            # распознано / вставлено / статус
+diktor phrases correct <id> "правильный текст"
+diktor vocab list [--source owner|claude|dir] # термины: ручные + имена каталогов проектов
+diktor vocab add "Claude Code"
+```
+
+Словарь применяется к каждой готовой фразе до записи в базу и вставки;
+распознанный текст хранится рядом (`phrases.raw_text`). Обычная запись
+меняет только это слово целиком («коммит» → «commit», «коммиты» остаются).
+Запись `--stem` — для имён: берёт падежные окончания (а у е ом ой ам ами ах
+ы и) через апостроф и отрывает приклеенный предлог (с в к о): «иксхаба» →
+«xhub'а», «Схабом» → «с xhub'ом». Регистр не важен, слова многословного
+ключа совпадают через один пробел или дефис. Демон перечитывает словарь при
+любом изменении таблицы, без перезапуска.
 
 ## Файлы
 
 | Что | Где |
 |---|---|
 | конфиг | `~/.config/diktor/config.toml` (пример: `contrib/config.example.toml`) |
-| база фраз | `~/.local/share/diktor/diktor.db` (SQLite, таблица `phrases`) |
+| база | `~/.local/share/diktor/diktor.db` (SQLite: `phrases`, `glossary`, `vocabulary`) |
 | сокет и состояние бара | `$XDG_RUNTIME_DIR/diktor/{diktor.sock,voice-state.json}` |
 | юнит | `~/.config/systemd/user/diktor.service` (`contrib/systemd/`) |
 | виджет бара Omarchy | `~/.config/omarchy/bar/modules/diktor.qml` (`contrib/omarchy/`) |
 
 Модель по умолчанию — `nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf`, ищется в
 `~/.local/share/diktor/models/`, затем (только чтение) в
-`~/.local/share/com.pais.handy/models/`. Язык `ru`, backend `auto` (Vulkan).
+`~/.local/share/com.pais.handy/models/`. Язык `auto` (модель сама определяет
+язык каждой фразы), backend `auto` (Vulkan). Стартовый словарь —
+`contrib/glossary.seed.toml`, загружается в базу один раз.
 
 ## Сборка и установка
 

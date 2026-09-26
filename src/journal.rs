@@ -4,8 +4,15 @@
 //! not dismissed either are the "rescue" the bar popup shows. Rows of a run
 //! that ended before an outcome was written (crash, kill -9) become failed
 //! with reason `interrupted` when the next daemon or CLI opens the database.
+//!
+//! The same database holds the glossary (spoken form -> written form, see
+//! `glossary.rs`) and the manual vocabulary; every glossary change bumps
+//! `meta.glossary_version` through triggers, so the daemon re-reads it before
+//! the next phrase whoever wrote it (CLI, sqlite3 by hand).
+use crate::glossary::Entries;
 use crate::voice_session::state::{lock, Target};
 use rusqlite::{params, Connection};
+use serde::Serialize;
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +25,8 @@ CREATE TABLE IF NOT EXISTS phrases (
     phrase INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
     text TEXT NOT NULL,
+    -- What the model recognised, when the glossary changed it into `text`.
+    raw_text TEXT,
     target_app TEXT,
     target_window TEXT,
     status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'failed')),
@@ -28,8 +37,112 @@ CREATE TABLE IF NOT EXISTS phrases (
     UNIQUE (run, session, phrase)
 );
 CREATE INDEX IF NOT EXISTS phrases_waiting ON phrases (status, copied_at, dismissed_at);
-PRAGMA user_version = 1;
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+INSERT OR IGNORE INTO meta (key, value) VALUES ('glossary_version', 0);
+CREATE TABLE IF NOT EXISTS glossary (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_text TEXT NOT NULL,
+    to_text TEXT NOT NULL,
+    -- 'word': that exact word; 'stem': also Russian case endings and a glued preposition.
+    kind TEXT NOT NULL DEFAULT 'word' CHECK (kind IN ('word', 'stem')),
+    source TEXT NOT NULL DEFAULT 'owner' CHECK (source IN ('owner', 'claude')),
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    UNIQUE (from_text, kind)
+);
+CREATE TRIGGER IF NOT EXISTS glossary_insert AFTER INSERT ON glossary
+    BEGIN UPDATE meta SET value = value + 1 WHERE key = 'glossary_version'; END;
+CREATE TRIGGER IF NOT EXISTS glossary_update AFTER UPDATE ON glossary
+    BEGIN UPDATE meta SET value = value + 1 WHERE key = 'glossary_version'; END;
+CREATE TRIGGER IF NOT EXISTS glossary_delete AFTER DELETE ON glossary
+    BEGIN UPDATE meta SET value = value + 1 WHERE key = 'glossary_version'; END;
+CREATE TABLE IF NOT EXISTS vocabulary (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    term TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    source TEXT NOT NULL DEFAULT 'owner' CHECK (source IN ('owner', 'claude')),
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1
+);
+PRAGMA user_version = 2;
 ";
+
+/// Imported once, on the first open of a database (`meta.seeded`); entries
+/// the owner removes later stay removed.
+const GLOSSARY_SEED: &str = include_str!("../contrib/glossary.seed.toml");
+const VOCABULARY_SEED: &[&str] = &[
+    "Hyprland",
+    "Omarchy",
+    "CachyOS",
+    "Quickshell",
+    "Claude",
+    "Claude Code",
+    "Opus",
+    "Sonnet",
+    "Fable",
+    "Haiku",
+    "Nemotron",
+    "Voxtral",
+    "Kokoro",
+    "X-Hub",
+    "xhub",
+    "aurelius",
+    "ulika",
+    "aletix",
+    "boostix",
+    "grelay",
+    "Telegram",
+    "Bitwarden",
+    "rclone",
+    "GitHub",
+    "commit",
+    "push",
+    "pull request",
+    "merge",
+    "branch",
+    "worktree",
+    "deploy",
+    "rebase",
+];
+
+/// One glossary row, for `diktor glossary list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct GlossaryRow {
+    pub id: i64,
+    pub from: String,
+    pub to: String,
+    pub kind: String,
+    pub source: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+    pub enabled: bool,
+}
+
+/// One manual vocabulary term, for `diktor vocab list`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct VocabularyRow {
+    pub term: String,
+    pub source: String,
+    pub note: Option<String>,
+    pub created_at: i64,
+}
+
+/// One phrase, for `diktor phrases recent`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PhraseRow {
+    pub id: i64,
+    pub created_at: i64,
+    /// What the model recognised.
+    pub raw: String,
+    /// What was pasted (after the glossary).
+    pub text: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub target_app: Option<String>,
+    /// The owner's (or Claude's) correction: a reference sample for benchmarks.
+    pub corrected: Option<String>,
+}
 
 pub fn now_ms() -> i64 {
     SystemTime::now()
@@ -76,12 +189,212 @@ impl Journal {
         // A commit is on disk when it returns.
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.execute_batch(SCHEMA)?;
+        let has_raw: bool = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('phrases') WHERE name = 'raw_text'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_raw {
+            connection.execute_batch("ALTER TABLE phrases ADD COLUMN raw_text TEXT")?;
+        }
+        let has_correction: bool = connection.query_row(
+            "SELECT count(*) FROM pragma_table_info('phrases') WHERE name = 'corrected_text'",
+            [],
+            |row| row.get::<_, i64>(0).map(|n| n > 0),
+        )?;
+        if !has_correction {
+            connection.execute_batch(
+                "ALTER TABLE phrases ADD COLUMN corrected_text TEXT;
+                 ALTER TABLE phrases ADD COLUMN corrected_at INTEGER;",
+            )?;
+        }
         let journal = Self {
             connection: Mutex::new(connection),
             run,
         };
         journal.retain(keep_days, keep_phrases)?;
+        journal.seed()?;
         Ok(journal)
+    }
+
+    fn seed(&self) -> rusqlite::Result<()> {
+        let mut connection = lock(&self.connection);
+        let transaction = connection.transaction()?;
+        let seeded = transaction
+            .query_row("SELECT value FROM meta WHERE key = 'seeded'", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .is_ok();
+        if !seeded {
+            let entries: Entries = toml::from_str(GLOSSARY_SEED)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let now = now_ms();
+            for (kind, map) in [("word", &entries.words), ("stem", &entries.stems)] {
+                for (from, to) in map {
+                    transaction.execute(
+                        "INSERT OR IGNORE INTO glossary (from_text, to_text, kind, note, created_at)
+                         VALUES (?1, ?2, ?3, 'seed', ?4)",
+                        params![crate::glossary::normalise(from), to, kind, now],
+                    )?;
+                }
+            }
+            for term in VOCABULARY_SEED {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO vocabulary (term, note, created_at) VALUES (?1, 'seed', ?2)",
+                    params![term, now],
+                )?;
+            }
+            transaction.execute("INSERT INTO meta (key, value) VALUES ('seeded', 1)", [])?;
+        }
+        transaction.commit()
+    }
+
+    /// Bumped by triggers on every glossary change.
+    pub fn glossary_version(&self) -> rusqlite::Result<i64> {
+        lock(&self.connection).query_row(
+            "SELECT value FROM meta WHERE key = 'glossary_version'",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn glossary_rows(&self) -> rusqlite::Result<Vec<GlossaryRow>> {
+        let connection = lock(&self.connection);
+        let mut statement = connection.prepare(
+            "SELECT id, from_text, to_text, kind, source, note, created_at, enabled
+             FROM glossary ORDER BY kind DESC, from_text",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(GlossaryRow {
+                id: row.get(0)?,
+                from: row.get(1)?,
+                to: row.get(2)?,
+                kind: row.get(3)?,
+                source: row.get(4)?,
+                note: row.get(5)?,
+                created_at: row.get(6)?,
+                enabled: row.get::<_, i64>(7)? != 0,
+            })
+        })?;
+        rows.collect()
+    }
+
+    /// Enabled entries, as the matcher takes them.
+    pub fn glossary(&self) -> rusqlite::Result<Entries> {
+        let mut entries = Entries::default();
+        for row in self.glossary_rows()?.into_iter().filter(|row| row.enabled) {
+            let map = if row.kind == "stem" {
+                &mut entries.stems
+            } else {
+                &mut entries.words
+            };
+            map.insert(row.from, row.to);
+        }
+        Ok(entries)
+    }
+
+    /// Adds or replaces the entry for `from` of this kind.
+    pub fn glossary_add(
+        &self,
+        from: &str,
+        to: &str,
+        stem: bool,
+        source: &str,
+        note: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        lock(&self.connection).execute(
+            "INSERT INTO glossary (from_text, to_text, kind, source, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (from_text, kind) DO UPDATE SET
+                 to_text = excluded.to_text, source = excluded.source,
+                 note = excluded.note, created_at = excluded.created_at, enabled = 1",
+            params![
+                crate::glossary::normalise(from),
+                to,
+                if stem { "stem" } else { "word" },
+                source,
+                note,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Removes `from` (both kinds unless one is given); returns rows removed.
+    pub fn glossary_remove(&self, from: &str, kind: Option<&str>) -> rusqlite::Result<usize> {
+        lock(&self.connection).execute(
+            "DELETE FROM glossary WHERE from_text = ?1 AND (?2 IS NULL OR kind = ?2)",
+            params![crate::glossary::normalise(from), kind],
+        )
+    }
+
+    pub fn vocabulary(&self) -> rusqlite::Result<Vec<VocabularyRow>> {
+        let connection = lock(&self.connection);
+        let mut statement = connection.prepare(
+            "SELECT term, source, note, created_at FROM vocabulary WHERE enabled = 1 ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(VocabularyRow {
+                term: row.get(0)?,
+                source: row.get(1)?,
+                note: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn vocabulary_add(
+        &self,
+        term: &str,
+        source: &str,
+        note: Option<&str>,
+    ) -> rusqlite::Result<()> {
+        lock(&self.connection).execute(
+            "INSERT INTO vocabulary (term, source, note, created_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (term) DO UPDATE SET enabled = 1, source = excluded.source, note = excluded.note",
+            params![term.trim(), source, note, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn vocabulary_remove(&self, term: &str) -> rusqlite::Result<usize> {
+        lock(&self.connection).execute(
+            "DELETE FROM vocabulary WHERE term = ?1",
+            params![term.trim()],
+        )
+    }
+
+    /// Newest `limit` phrases, newest first.
+    pub fn recent(&self, limit: usize) -> rusqlite::Result<Vec<PhraseRow>> {
+        let connection = lock(&self.connection);
+        let mut statement = connection.prepare(
+            "SELECT id, created_at, COALESCE(raw_text, text), text, status, reason, target_app,
+                    corrected_text
+             FROM phrases ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows =
+            statement.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(PhraseRow {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    raw: row.get(2)?,
+                    text: row.get(3)?,
+                    status: row.get(4)?,
+                    reason: row.get(5)?,
+                    target_app: row.get(6)?,
+                    corrected: row.get(7)?,
+                })
+            })?;
+        rows.collect()
+    }
+
+    /// Stores the right text for phrase `id`; false when there is no such phrase.
+    pub fn correct(&self, id: i64, text: &str) -> rusqlite::Result<bool> {
+        Ok(lock(&self.connection).execute(
+            "UPDATE phrases SET corrected_text = ?2, corrected_at = ?3 WHERE id = ?1",
+            params![id, text, now_ms()],
+        )? == 1)
     }
 
     fn retain(&self, keep_days: u32, keep_phrases: u32) -> rusqlite::Result<()> {
@@ -109,18 +422,20 @@ impl Journal {
         session: u64,
         phrase: u64,
         text: &str,
+        raw: Option<&str>,
         target: Option<&Target>,
     ) -> rusqlite::Result<()> {
         lock(&self.connection).execute(
             "INSERT OR IGNORE INTO phrases
-                 (run, session, phrase, created_at, text, target_app, target_window, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending')",
+                 (run, session, phrase, created_at, text, raw_text, target_app, target_window, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
             params![
                 self.run,
                 session,
                 phrase,
                 now_ms(),
                 text,
+                raw,
                 target.map(|t| &t.app_id),
                 target.map(|t| &t.id)
             ],
@@ -204,6 +519,16 @@ impl Journal {
     /// The newest `n` phrases no window received, copied or not, oldest first.
     pub fn last_undelivered(&self, n: usize) -> rusqlite::Result<Vec<Phrase>> {
         self.select("status = 'failed'", i64::try_from(n).unwrap_or(i64::MAX))
+    }
+
+    /// What the model recognised (before the glossary) since `since_ms`.
+    pub fn recognised_since(&self, since_ms: i64) -> rusqlite::Result<Vec<String>> {
+        let connection = lock(&self.connection);
+        let mut statement = connection.prepare(
+            "SELECT COALESCE(raw_text, text) FROM phrases WHERE created_at >= ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![since_ms], |row| row.get(0))?;
+        rows.collect()
     }
 
     fn mark(&self, column: &str, ids: &[i64]) -> rusqlite::Result<()> {
@@ -319,7 +644,7 @@ mod tests {
     fn pending_before_paste_then_delivered_never_waits() {
         let path = database("delivered");
         let journal = Journal::open_at(&path, "run-a".into(), 30, 1000).unwrap();
-        journal.phrase(1, 1, "вставлено", None).unwrap();
+        journal.phrase(1, 1, "вставлено", None, None).unwrap();
         assert_eq!(journal.outcome(1, 1), Some(("pending".into(), None)));
         journal.delivered(1, 1, &target("0xA")).unwrap();
         assert_eq!(journal.outcome(1, 1), Some(("delivered".into(), None)));
@@ -333,12 +658,12 @@ mod tests {
         let path = database("rescue");
         {
             let journal = Journal::open_at(&path, "run-a".into(), 30, 1000).unwrap();
-            journal.phrase(1, 1, "не туда", None).unwrap();
+            journal.phrase(1, 1, "не туда", None, None).unwrap();
             journal
                 .failed(1, 1, "target_changed", Some(&target("0xA")))
                 .unwrap();
             // Killed between the journal and the paste.
-            journal.phrase(1, 2, "оборвалось", None).unwrap();
+            journal.phrase(1, 2, "оборвалось", None, None).unwrap();
         }
         let journal = Journal::open_at(&path, "run-b".into(), 30, 1000).unwrap();
         // Still this run's own pending phrase until interrupt_pending.
@@ -377,13 +702,99 @@ mod tests {
     }
 
     #[test]
+    fn raw_text_is_kept_next_to_the_glossary_text() {
+        let path = database("raw");
+        let journal = Journal::open_at(&path, "run-a".into(), 30, 1000).unwrap();
+        journal
+            .phrase(1, 1, "сделай commit", Some("сделай коммит"), None)
+            .unwrap();
+        let raw: Option<String> = lock(&journal.connection)
+            .query_row("SELECT raw_text FROM phrases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(raw.as_deref(), Some("сделай коммит"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn glossary_lives_in_the_database_seeded_once_and_versioned() {
+        let path = database("glossary");
+        let journal = Journal::open_at(&path, "run-a".into(), 30, 1000).unwrap();
+        let seeded = journal.glossary().unwrap();
+        assert_eq!(seeded.stems.get("иксхаб").map(String::as_str), Some("xhub"));
+        assert_eq!(
+            seeded.words.get("коммит").map(String::as_str),
+            Some("commit")
+        );
+        assert!(journal
+            .vocabulary()
+            .unwrap()
+            .iter()
+            .any(|v| v.term == "Hyprland"));
+        let version = journal.glossary_version().unwrap();
+        journal
+            .glossary_add(
+                "Пул  Реквест",
+                "pull request",
+                false,
+                "claude",
+                Some("from chat"),
+            )
+            .unwrap();
+        assert!(journal.glossary_version().unwrap() > version);
+        let row = journal
+            .glossary_rows()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.from == "пул реквест")
+            .unwrap();
+        assert_eq!(
+            (row.source.as_str(), row.note.as_deref()),
+            ("claude", Some("from chat"))
+        );
+        // Removing a seed entry sticks: seeding runs once per database.
+        assert_eq!(journal.glossary_remove("коммит", None).unwrap(), 1);
+        drop(journal);
+        let journal = Journal::open_at(&path, "run-b".into(), 30, 1000).unwrap();
+        assert!(!journal.glossary().unwrap().words.contains_key("коммит"));
+        assert!(journal
+            .glossary()
+            .unwrap()
+            .words
+            .contains_key("пул реквест"));
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn recent_phrases_carry_raw_final_and_correction() {
+        let path = database("recent");
+        let journal = Journal::open_at(&path, "run-a".into(), 30, 1000).unwrap();
+        journal
+            .phrase(1, 1, "сделай commit", Some("сделай камит"), None)
+            .unwrap();
+        journal.phrase(1, 2, "вторая", None, None).unwrap();
+        let recent = journal.recent(10).unwrap();
+        assert_eq!(recent[0].text, "вторая");
+        assert_eq!(recent[1].raw, "сделай камит");
+        assert_eq!(recent[1].text, "сделай commit");
+        assert!(journal
+            .correct(recent[1].id, "сделай commit и push")
+            .unwrap());
+        assert!(!journal.correct(9999, "нет такой").unwrap());
+        assert_eq!(
+            journal.recent(10).unwrap()[1].corrected.as_deref(),
+            Some("сделай commit и push")
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn retention_keeps_the_newest_rows() {
         let path = database("retention");
         {
             let journal = Journal::open_at(&path, "run-a".into(), 30, 1000).unwrap();
             for phrase in 1..=5 {
                 journal
-                    .phrase(1, phrase, &format!("фраза {phrase}"), None)
+                    .phrase(1, phrase, &format!("фраза {phrase}"), None, None)
                     .unwrap();
                 journal.failed(1, phrase, "cancelled", None).unwrap();
             }

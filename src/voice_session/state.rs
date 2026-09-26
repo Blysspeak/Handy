@@ -78,6 +78,17 @@ pub struct PasteRequest {
     pub text: String,
 }
 
+/// A final phrase for the journal: pasted text, and the recognised text
+/// when the glossary changed it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unjournaled {
+    pub generation: u64,
+    pub phrase: u64,
+    pub text: String,
+    pub raw: Option<String>,
+    pub target: Option<Target>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SubmitRequest {
     pub generation: u64,
@@ -97,6 +108,8 @@ struct Pending {
     committed_at: Instant,
     /// Final text already handed out for the durable journal.
     journaled: bool,
+    /// Recognised text before the rewrite, when the rewrite changed it.
+    raw: Option<String>,
 }
 
 /// Field diagnostics for the phrase being captured; cleared at its commit.
@@ -134,9 +147,13 @@ struct Inner {
     activity: Activity,
 }
 
+/// Rewrites a final phrase before it is journaled and pasted (the glossary).
+pub type Rewrite = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 pub struct VoiceQueue {
     inner: Mutex<Inner>,
     wake: Condvar,
+    rewrite: Option<Rewrite>,
 }
 
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -194,8 +211,14 @@ impl Drop for BoundaryMarker {
 }
 
 impl VoiceQueue {
+    #[cfg(test)]
     pub fn new(generation: u64) -> Self {
+        Self::with_rewrite(generation, None)
+    }
+
+    pub fn with_rewrite(generation: u64, rewrite: Option<Rewrite>) -> Self {
         Self {
+            rewrite,
             inner: Mutex::new(Inner {
                 snapshot: Snapshot {
                     generation,
@@ -455,6 +478,7 @@ impl VoiceQueue {
             samples: s.input_samples,
             committed_at: Instant::now(),
             journaled: false,
+            raw: None,
         };
         s.pending.push_back(pending);
         s.commands.push_back(VoiceCommand::Commit { phrase });
@@ -538,6 +562,11 @@ impl VoiceQueue {
     }
 
     pub fn finalized(&self, generation: u64, phrase: u64, text: String) {
+        let raw = sanitize(&text);
+        let text = match &self.rewrite {
+            Some(rewrite) => sanitize(&rewrite(&raw)),
+            None => raw.clone(),
+        };
         let mut s = lock(&self.inner);
         if !s.active || s.snapshot.generation != generation {
             return;
@@ -549,7 +578,9 @@ impl VoiceQueue {
         else {
             return;
         };
-        let text = sanitize(&text);
+        if text != raw {
+            pending.raw = Some(raw);
+        }
         let chars = meaningful_chars(&text);
         let audio_ms = ms(pending.samples);
         let decoded = pending.committed_at.elapsed();
@@ -591,7 +622,7 @@ impl VoiceQueue {
     /// Final phrase texts not yet in the durable journal, oldest first. The
     /// caller writes them before taking the next paste, so no paste precedes
     /// its journal row. Works after the session stopped too.
-    pub fn take_unjournaled(&self) -> Vec<(u64, u64, String, Option<Target>)> {
+    pub fn take_unjournaled(&self) -> Vec<Unjournaled> {
         let mut s = lock(&self.inner);
         let generation = s.snapshot.generation;
         s.pending
@@ -600,7 +631,13 @@ impl VoiceQueue {
             .filter_map(|p| {
                 let text = p.text.clone().filter(|text| !text.trim().is_empty())?;
                 p.journaled = true;
-                Some((generation, p.phrase, text, p.target.clone()))
+                Some(Unjournaled {
+                    generation,
+                    phrase: p.phrase,
+                    text,
+                    raw: p.raw.clone(),
+                    target: p.target.clone(),
+                })
             })
             .collect()
     }
@@ -1450,7 +1487,13 @@ mod tests {
         q.finalized(7, 1, "первая".into());
         assert_eq!(
             q.take_unjournaled(),
-            [(7, 1, "первая".to_string(), Some(target("A")))]
+            [Unjournaled {
+                generation: 7,
+                phrase: 1,
+                text: "первая".into(),
+                raw: None,
+                target: Some(target("A")),
+            }]
         );
         assert!(q.take_unjournaled().is_empty());
         // Dropped noise is never journaled.
@@ -1464,6 +1507,20 @@ mod tests {
         q.cancel_keeping_draft();
         assert_eq!(q.unfinished_text(), "недосказанная мысль");
         assert_eq!(queue().unfinished_text(), "");
+    }
+
+    #[test]
+    fn voice_rewrite_changes_pasted_and_journaled_text_and_keeps_the_raw() {
+        let rewrite: Rewrite = Arc::new(|text: &str| text.replace("коммит", "commit"));
+        let q = VoiceQueue::with_rewrite(7, Some(rewrite));
+        q.ready();
+        q.feed(&[1.]);
+        automatic_commit(&q, "A");
+        q.finalized(7, 1, "сделай коммит".into());
+        let journal = q.take_unjournaled();
+        assert_eq!(journal[0].text, "сделай commit");
+        assert_eq!(journal[0].raw.as_deref(), Some("сделай коммит"));
+        assert_eq!(q.take_paste().unwrap().text, "сделай commit");
     }
 
     #[test]

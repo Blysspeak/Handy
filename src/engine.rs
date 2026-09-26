@@ -65,7 +65,9 @@ fn run_voice_worker(
 
 struct CppVoiceEngine<'a> {
     session: &'a mut Session,
-    options: RunOptions,
+    /// Read at every phrase: `diktor lang` applies from the next phrase on.
+    language: &'a Mutex<String>,
+    languages: Vec<String>,
 }
 
 struct CppVoiceStream<'a>(transcribe_cpp::Stream<'a>);
@@ -84,9 +86,14 @@ impl VoicePhraseStream for CppVoiceStream<'_> {
 
 impl VoiceEngine for CppVoiceEngine<'_> {
     fn begin(&mut self) -> Result<Box<dyn VoicePhraseStream + '_>> {
+        let requested = voice_lock(self.language).clone();
+        let options = RunOptions {
+            language: voice_language(&requested, &self.languages)?,
+            task: Task::Transcribe,
+            ..Default::default()
+        };
         Ok(Box::new(CppVoiceStream(
-            self.session
-                .stream(&self.options, &StreamOptions::default())?,
+            self.session.stream(&options, &StreamOptions::default())?,
         )))
     }
 }
@@ -209,7 +216,10 @@ enum Slot {
 pub struct Transcriber {
     model_path: PathBuf,
     backend: Backend,
-    language: String,
+    /// Model language code or "auto"; changed live by `diktor lang`.
+    language: Mutex<String>,
+    /// The loaded model's languages, for validating `diktor lang`.
+    languages: Mutex<Vec<String>>,
     slot: Mutex<Slot>,
     changed: Condvar,
     route: Arc<VoiceRoute>,
@@ -227,7 +237,8 @@ impl Transcriber {
         Arc::new(Self {
             model_path,
             backend,
-            language,
+            language: Mutex::new(language),
+            languages: Mutex::new(Vec::new()),
             slot: Mutex::new(Slot::Loading),
             changed: Condvar::new(),
             route,
@@ -272,6 +283,7 @@ impl Transcriber {
             transcribe_cpp::Error::NotImplemented("Model has no live stream".into())
         );
         let session = model.session()?;
+        *voice_lock(&self.languages) = caps.languages.clone();
         log::info!(
             "Model loaded in {:?}: arch={} backend={} languages={}",
             began.elapsed(),
@@ -280,6 +292,22 @@ impl Transcriber {
             caps.languages.len()
         );
         Ok(session)
+    }
+
+    pub fn language(&self) -> String {
+        voice_lock(&self.language).clone()
+    }
+
+    /// Takes effect from the next phrase, also inside a running session.
+    /// Refused when the loaded model does not know the language.
+    pub fn set_language(&self, requested: &str) -> Result<()> {
+        let languages = voice_lock(&self.languages).clone();
+        if !languages.is_empty() {
+            voice_language(requested, &languages)?;
+        }
+        *voice_lock(&self.language) = requested.to_string();
+        log::info!("Voice language set to {requested}");
+        Ok(())
     }
 
     /// "loading", "ready", "in use" or "failed: <cause>".
@@ -367,12 +395,17 @@ impl Transcriber {
             anyhow::bail!("No model loaded");
         };
         let caps = session.model().capabilities();
-        let options = RunOptions {
-            language: voice_language(&self.language, &caps.languages)?,
-            task: Task::Transcribe,
-            ..Default::default()
-        };
-        drive_voice_session(&mut CppVoiceEngine { session, options }, queue, ready)
+        // An unsupported language fails here, before readiness.
+        voice_language(&self.language(), &caps.languages)?;
+        drive_voice_session(
+            &mut CppVoiceEngine {
+                session,
+                language: &self.language,
+                languages: caps.languages,
+            },
+            queue,
+            ready,
+        )
     }
 
     pub fn end_voice_session(&self, queue: &VoiceQueue) {
@@ -702,19 +735,16 @@ mod voice_pipeline_tests {
                     model.backend(),
                     model.arch()
                 );
-                let options = RunOptions {
-                    language: voice_language("ru", &caps.languages)?,
-                    task: Task::Transcribe,
-                    ..Default::default()
-                };
                 eprintln!(
                     "native voice requested_language=ru resolved_language={:?}",
-                    options.language
+                    voice_language("ru", &caps.languages)?
                 );
+                let language = Mutex::new("ru".to_string());
                 drive_voice_session(
                     &mut CppVoiceEngine {
                         session: &mut session,
-                        options,
+                        language: &language,
+                        languages: caps.languages.clone(),
                     },
                     &worker_queue,
                     ready,

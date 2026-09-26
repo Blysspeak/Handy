@@ -27,6 +27,7 @@ Item {
   // "off" | "listening" | "speech" | "sending" | "error"; `state` is taken by Item.
   property string voiceState: "off"
   property string tooltip: ""
+  property string language: ""
   property var rescue: null
   // Hidden locally when another bar popup takes over; a new failure (new id) reopens it.
   property string hiddenRescueId: ""
@@ -40,6 +41,7 @@ Item {
     try { data = JSON.parse(raw) } catch (e) {}
     voiceState = String(data.state || "off")
     tooltip = String(data.tooltip || "")
+    language = String(data.language || "")
     rescue = data.rescue && data.rescue.text ? data.rescue : null
   }
 
@@ -81,7 +83,8 @@ Item {
     dimmed: root.voiceState === "off"
     active: ["speech", "sending", "error"].indexOf(root.voiceState) >= 0
     activeColor: root.voiceState === "error" ? Color.urgent : Color.accent
-    tooltipText: root.tooltip ? "Diktor\n" + root.tooltip : "Diktor"
+    tooltipText: (root.language ? "Diktor · " + root.language.toUpperCase() : "Diktor")
+      + (root.tooltip ? "\n" + root.tooltip : "")
     onPressed: function(b) {
       if (b === Qt.RightButton) root.run("copy")
       else if (b === Qt.LeftButton) root.run("toggle")

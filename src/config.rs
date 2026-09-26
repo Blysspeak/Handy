@@ -13,7 +13,8 @@ pub struct Config {
     /// Path to a streaming GGUF model, or a bare file name/id looked up in
     /// `model_dirs()`.
     pub model: String,
-    /// Recognition language as the model names it (`ru`, `en`, ...) or `auto`.
+    /// Recognition language as the model names it (`ru`, `en`, ...) or
+    /// `auto` (the model detects it per phrase). `diktor lang` changes it.
     pub language: String,
     /// `default` for the system default input, or a name from `diktor devices`.
     pub input_device: String,
@@ -26,19 +27,25 @@ pub struct Config {
     pub keep_phrases: u32,
     /// `error`, `warn`, `info`, `debug` (debug also logs recognised text).
     pub log_level: String,
+    /// Directories whose subdirectory names join the vocabulary.
+    pub vocabulary_dirs: Vec<String>,
+    /// Subdirectory names too generic to be terms.
+    pub vocabulary_skip: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             model: DEFAULT_MODEL.into(),
-            language: "ru".into(),
+            language: "auto".into(),
             input_device: "default".into(),
             backend: "auto".into(),
             vad_model: String::new(),
             keep_days: 30,
             keep_phrases: 1000,
             log_level: "info".into(),
+            vocabulary_dirs: vec!["~/workSpace/project".into()],
+            vocabulary_skip: vec!["src".into(), "archive".into(), "spec-kit".into()],
         }
     }
 }
@@ -68,6 +75,54 @@ pub fn config_path() -> PathBuf {
     std::env::var_os("DIKTOR_CONFIG")
         .map(PathBuf::from)
         .unwrap_or_else(|| xdg("XDG_CONFIG_HOME", ".config").join("diktor/config.toml"))
+}
+
+/// `auto`, or a language code like `ru`, `en`, `pt-BR`.
+pub fn valid_language(code: &str) -> bool {
+    code == "auto"
+        || code.split('-').enumerate().all(|(i, part)| {
+            (2..=4).contains(&part.len())
+                && part.chars().all(|c| c.is_ascii_alphabetic())
+                && (i > 0 || part.chars().all(|c| c.is_ascii_lowercase()))
+        })
+}
+
+/// Writes `language = "<code>"` into the config file, keeping every other
+/// line; creates the file when missing. Atomic, and only if it still parses.
+pub fn save_language(path: &Path, code: &str) -> anyhow::Result<()> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(anyhow::anyhow!("{}: {error}", path.display())),
+    };
+    let line = format!("language = {}", toml::Value::String(code.to_string()));
+    let mut replaced = false;
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|existing| {
+            let key = existing.split('=').next().unwrap_or("").trim();
+            if !replaced && key == "language" {
+                replaced = true;
+                line.clone()
+            } else {
+                existing.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        lines.push(line);
+    }
+    let updated = lines.join("\n") + "\n";
+    let config: Config =
+        toml::from_str(&updated).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+    anyhow::ensure!(config.language == code, "language not saved");
+    if let Some(directory) = path.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    let temporary = path.with_extension("toml.tmp");
+    std::fs::write(&temporary, updated)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
 }
 
 /// Phrase journal directory: `$DIKTOR_DATA_DIR`, else `$XDG_DATA_HOME/diktor`.
@@ -172,7 +227,7 @@ mod tests {
     fn empty_file_is_the_owner_setup_and_unknown_keys_are_rejected() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.model, DEFAULT_MODEL);
-        assert_eq!(config.language, "ru");
+        assert_eq!(config.language, "auto");
         assert_eq!(config.input_device(), None);
         assert!(matches!(
             config.backend(),
@@ -189,6 +244,27 @@ mod tests {
             .unwrap()
             .backend()
             .is_err());
+    }
+
+    #[test]
+    fn language_is_saved_in_place_and_validated() {
+        let directory = std::env::temp_dir().join(format!("diktor-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let path = directory.join("config.toml");
+        save_language(&path, "en").unwrap();
+        assert_eq!(Config::load(&path).unwrap().language, "en");
+        std::fs::write(
+            &path,
+            "# mine\nmodel = \"x.gguf\"\nlanguage = \"ru\" # note\n",
+        )
+        .unwrap();
+        save_language(&path, "auto").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# mine\nmodel = \"x.gguf\"\n"));
+        assert_eq!(Config::load(&path).unwrap().language, "auto");
+        assert!(valid_language("ru") && valid_language("auto") && valid_language("pt-BR"));
+        assert!(!valid_language("RU") && !valid_language("r") && !valid_language("ru;x"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

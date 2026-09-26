@@ -7,8 +7,10 @@
 # ~/.local/share/com.pais.handy/models/.
 model = "nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf"
 
-# Recognition language as the model names it ("ru", "en", ...) or "auto".
-language = "ru"
+# Recognition language as the model names it ("ru", "en", ...) or "auto":
+# the model detects the language of every phrase (Russian and English both).
+# `diktor lang ru|en|auto` changes it from the next phrase on and saves it here.
+language = "auto"
 
 # Microphone: "default" follows the system default input; otherwise a name
 # printed by `diktor devices`.
@@ -27,3 +29,8 @@ keep_phrases = 1000
 
 # "error", "warn", "info" or "debug". Debug also logs recognised text.
 log_level = "info"
+
+# Vocabulary: names of the subdirectories here are terms too (xhub-devbot is
+# also "xhub devbot"); `diktor vocab list` shows the effective list.
+vocabulary_dirs = ["~/workSpace/project"]
+vocabulary_skip = ["src", "archive", "spec-kit"]

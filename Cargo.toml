@@ -14,6 +14,7 @@ env_logger = "0.10"
 hound = "3.5.1"
 libc = "0.2"
 log = "0.4.25"
+regex = "1"
 rubato = "0.16.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 rustfft = "6.4.0"

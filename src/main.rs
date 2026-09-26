@@ -3,10 +3,13 @@
 //! the other subcommands talk to it over a Unix socket.
 mod audio;
 mod audio_toolkit;
+mod cli_terms;
 mod config;
 mod engine;
+mod glossary;
 mod ipc;
 mod journal;
+mod vocabulary;
 mod voice_session;
 
 use clap::{Parser, Subcommand};
@@ -48,12 +51,47 @@ enum Command {
     Copy { n: Option<usize> },
     /// Close the bar popup; its phrases stay in the journal for `copy`.
     Dismiss,
+    /// Recognition language: ru, en, ... or auto (the model detects it per
+    /// phrase). Applies from the next phrase and is saved in the config.
+    Lang { language: String },
+    /// Personal glossary (spoken form -> written form), applied to every phrase.
+    Glossary {
+        #[command(subcommand)]
+        action: cli_terms::GlossaryAction,
+    },
+    /// Recognised phrases in diktor.db.
+    #[command(visible_alias = "phrase")]
+    Phrases {
+        #[command(subcommand)]
+        action: cli_terms::PhrasesAction,
+    },
+    /// The owner's vocabulary: manual terms and project directory names.
+    Vocab {
+        #[command(subcommand)]
+        action: cli_terms::VocabAction,
+    },
+    /// Latin/all-caps tokens in recognised text that no glossary entry covers.
+    Misses {
+        #[arg(long, default_value_t = 30)]
+        days: u32,
+        #[arg(long)]
+        json: bool,
+    },
     /// Input device names accepted by `input_device` in the config.
     Devices,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if !matches!(cli.command, Command::Daemon { .. }) {
+        // `diktor glossary list | head` should end quietly like any CLI, not
+        // panic on the closed pipe. The daemon keeps SIGPIPE ignored: a client
+        // hanging up mid-reply must not kill it.
+        // SAFETY: restoring the default disposition before any thread starts.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     let result = match cli.command {
         Command::Daemon { config, input_wav } => {
             daemon(config.unwrap_or_else(config::config_path), input_wav)
@@ -63,6 +101,11 @@ fn main() -> ExitCode {
         Command::Status => status(),
         Command::Copy { n } => copy(n),
         Command::Dismiss => dismiss(),
+        Command::Lang { language } => lang(&language),
+        Command::Glossary { action } => cli_terms::glossary_command(action),
+        Command::Phrases { action } => cli_terms::phrases_command(action),
+        Command::Vocab { action } => cli_terms::vocab_command(action),
+        Command::Misses { days, json } => cli_terms::misses_command(days, json),
         Command::Devices => devices(),
     };
     match result {
@@ -141,11 +184,13 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
     let transcriber =
         engine::Transcriber::new(model_path.clone(), backend, config.language.clone(), route);
     transcriber.load_in_background();
+    let glossary = Arc::new(glossary::Glossary::new(Arc::clone(&journal)));
     let manager = voice_session::VoiceSessionManager::new(
         audio,
         Arc::clone(&transcriber),
         Arc::clone(&journal),
         runtime,
+        Some(Arc::new(move |text: &str| glossary.apply(text))),
     );
     manager.initialize();
 
@@ -173,10 +218,20 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
                     "voice": voice(&server_manager),
                     "model": transcriber.model_state(),
                     "model_path": model_path.display().to_string(),
+                    "language": transcriber.language(),
                     "rss_kb": rss_kb(),
                     "waiting": journal.waiting().map(|w| w.len()).ok(),
                     "rescue": journal.rescue().map(|r| r.len()).ok(),
                 }),
+                lang if lang.starts_with("lang ") => {
+                    match transcriber.set_language(lang.trim_start_matches("lang ").trim()) {
+                        Ok(()) => {
+                            server_manager.refresh_bar(server_manager.snapshot().as_ref());
+                            json!({ "ok": true, "language": transcriber.language() })
+                        }
+                        Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
+                    }
+                }
                 // The CLI changed the journal (copy, dismiss): redraw the bar.
                 "refresh" => {
                     server_manager.reload_rescue();
@@ -230,6 +285,7 @@ fn status() -> anyhow::Result<ExitCode> {
     println!("daemon: running, pid {}", text("pid"));
     println!("voice: {}", text("voice"));
     println!("model: {} ({})", text("model"), text("model_path"));
+    println!("language: {}", text("language"));
     println!("rss: {} kB", text("rss_kb"));
     println!(
         "undelivered: {} not copied, {} in the bar popup",
@@ -281,6 +337,33 @@ fn dismiss() -> anyhow::Result<ExitCode> {
     let ids: Vec<i64> = journal.rescue()?.iter().map(|p| p.id).collect();
     journal.dismissed(&ids)?;
     let _ = ipc::request(&socket, "refresh");
+    Ok(ExitCode::SUCCESS)
+}
+
+fn lang(code: &str) -> anyhow::Result<ExitCode> {
+    anyhow::ensure!(
+        config::valid_language(code),
+        "{code:?}: ожидается auto или код языка (ru, en, ...)"
+    );
+    // The running daemon checks the code against the model before it is saved.
+    let applied = match ipc::request(&socket()?, &format!("lang {code}")) {
+        Ok(reply) if reply["ok"].as_bool() == Some(true) => true,
+        Ok(reply) => anyhow::bail!("{}", reply["error"].as_str().unwrap_or("отказ демона")),
+        Err(_) => false,
+    };
+    let path = config::config_path();
+    config::save_language(&path, code)?;
+    if applied {
+        println!(
+            "язык: {code} (со следующей фразы; сохранён в {})",
+            path.display()
+        );
+    } else {
+        println!(
+            "язык: {code} (демон не запущен; сохранён в {})",
+            path.display()
+        );
+    }
     Ok(ExitCode::SUCCESS)
 }
 

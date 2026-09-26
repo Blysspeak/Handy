@@ -307,6 +307,7 @@ dependencies = [
  "hound",
  "libc",
  "log",
+ "regex",
  "rubato",
  "rusqlite",
  "rustfft",

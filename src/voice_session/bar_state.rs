@@ -2,7 +2,7 @@
 //! widget watches one small JSON file, replaced atomically and only when what
 //! the bar shows changes:
 //!
-//! `{state, tooltip, rescue: null | {id, count, title, reason, text, copy, close}}`
+//! `{state, tooltip, language, rescue: null | {id, count, title, reason, text, copy, close}}`
 //!
 //! `state` is only the live voice state (off / listening / speech / sending /
 //! error). `rescue` is text no window received: the widget shows it in a
@@ -58,10 +58,11 @@ pub fn reason_text(code: &str) -> &'static str {
 struct Shown {
     state: &'static str,
     tooltip: &'static str,
+    language: String,
     rescue: Vec<Phrase>,
 }
 
-fn shown(snapshot: Option<&Snapshot>, rescue: &[Phrase]) -> Shown {
+fn shown(snapshot: Option<&Snapshot>, rescue: &[Phrase], language: &str) -> Shown {
     let (state, tooltip) = match snapshot.map(|s| (s.status, s.speech_active, s.error.as_deref())) {
         None | Some((Status::Off, ..)) => ("off", ""),
         Some((Status::Stopping, ..)) => ("off", status_text("stopping")),
@@ -76,6 +77,7 @@ fn shown(snapshot: Option<&Snapshot>, rescue: &[Phrase]) -> Shown {
     Shown {
         state,
         tooltip,
+        language: language.to_string(),
         rescue: rescue.to_vec(),
     }
 }
@@ -97,6 +99,8 @@ struct RescueFile {
 struct BarFile<'a> {
     state: &'a str,
     tooltip: &'a str,
+    /// Recognition language: "auto", "ru", "en", ...
+    language: &'a str,
     rescue: Option<RescueFile>,
 }
 
@@ -113,6 +117,7 @@ fn render(shown: &Shown) -> BarFile<'_> {
     BarFile {
         state: shown.state,
         tooltip: shown.tooltip,
+        language: &shown.language,
         rescue,
     }
 }
@@ -133,8 +138,8 @@ impl BarState {
 
     /// `snapshot` None is "voice mode off"; written at startup so a crash
     /// cannot leave a stale "listening" behind.
-    pub fn show(&self, snapshot: Option<&Snapshot>, rescue: &[Phrase]) {
-        let shown = shown(snapshot, rescue);
+    pub fn show(&self, snapshot: Option<&Snapshot>, rescue: &[Phrase], language: &str) {
+        let shown = shown(snapshot, rescue, language);
         let mut last = lock(&self.last);
         if last.as_ref() == Some(&shown) {
             return;
@@ -191,8 +196,9 @@ mod tests {
     #[test]
     fn icon_is_only_the_live_state_even_with_text_to_rescue() {
         let rescue = [phrase(1, "текст", "target_changed")];
-        let state = |status, speech| shown(Some(&snapshot(status, speech, None)), &rescue).state;
-        assert_eq!(shown(None, &rescue).state, "off");
+        let state =
+            |status, speech| shown(Some(&snapshot(status, speech, None)), &rescue, "auto").state;
+        assert_eq!(shown(None, &rescue, "auto").state, "off");
         assert_eq!(state(Status::Off, false), "off");
         assert_eq!(state(Status::Stopping, false), "off");
         assert_eq!(state(Status::Loading, false), "listening");
@@ -211,9 +217,11 @@ mod tests {
                 phrase(3, "первая ", "target_changed"),
                 phrase(5, "вторая", "interrupted"),
             ],
+            "en",
         );
         let json: Value = serde_json::to_value(render(&shown)).unwrap();
         assert_eq!(json["state"], "off");
+        assert_eq!(json["language"], "en");
         assert_eq!(json["rescue"]["id"], "5");
         assert_eq!(json["rescue"]["count"], 2);
         assert_eq!(json["rescue"]["title"], "Не вставлено: 2");
@@ -221,9 +229,13 @@ mod tests {
         assert_eq!(json["rescue"]["reason"], reason_text("interrupted"));
         assert_eq!(json["rescue"]["copy"], "Скопировать");
         assert_eq!(json["rescue"]["close"], "Закрыть");
-        let none: Value = serde_json::to_value(render(&super::shown(None, &[]))).unwrap();
+        let none: Value = serde_json::to_value(render(&super::shown(None, &[], "auto"))).unwrap();
         assert!(none["rescue"].is_null());
-        let error = super::shown(Some(&snapshot(Status::Error, false, Some("weird"))), &[]);
+        let error = super::shown(
+            Some(&snapshot(Status::Error, false, Some("weird"))),
+            &[],
+            "auto",
+        );
         assert_eq!(error.tooltip, reason_text("model"));
     }
 
@@ -233,17 +245,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         let bar = BarState::new(directory.clone());
         let mut listening = snapshot(Status::Listening, false, None);
-        bar.show(Some(&listening), &[]);
+        bar.show(Some(&listening), &[], "ru");
         let first = std::fs::metadata(&bar.path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         listening.revision += 1;
         listening.silence_remaining_ms = Some(500);
-        bar.show(Some(&listening), &[]);
+        bar.show(Some(&listening), &[], "ru");
         assert_eq!(
             std::fs::metadata(&bar.path).unwrap().modified().unwrap(),
             first
         );
-        bar.show(None, &[phrase(1, "текст", "cancelled")]);
+        bar.show(None, &[phrase(1, "текст", "cancelled")], "ru");
         let written: Value = serde_json::from_slice(&std::fs::read(&bar.path).unwrap()).unwrap();
         assert_eq!(written["state"], "off");
         assert_eq!(written["rescue"]["text"], "текст");

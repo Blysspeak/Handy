@@ -8,7 +8,8 @@ use crate::journal::{Journal, Phrase};
 use bar_state::BarState;
 use desktop::DesktopBridge;
 use state::{
-    lock, BoundaryMarker, PasteRequest, Snapshot, Status, Target, VoiceQueue, COMMIT_TIMEOUT,
+    lock, BoundaryMarker, PasteRequest, Rewrite, Snapshot, Status, Target, VoiceQueue,
+    COMMIT_TIMEOUT,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,6 +52,8 @@ pub struct VoiceSessionManager {
     /// Hyprland only: state goes to the Omarchy bar widget.
     bar: OnceLock<BarState>,
     runtime: PathBuf,
+    /// The glossary, applied to every final phrase.
+    rewrite: Option<Rewrite>,
 }
 
 impl VoiceSessionManager {
@@ -59,6 +62,7 @@ impl VoiceSessionManager {
         transcription: Arc<Transcriber>,
         journal: Arc<Journal>,
         runtime: PathBuf,
+        rewrite: Option<Rewrite>,
     ) -> Arc<Self> {
         let manager = Arc::new(Self {
             audio,
@@ -71,6 +75,7 @@ impl VoiceSessionManager {
             rescue: Mutex::new(Vec::new()),
             bar: OnceLock::new(),
             runtime,
+            rewrite,
         });
         manager.reload_rescue();
         manager
@@ -133,7 +138,7 @@ impl VoiceSessionManager {
             return;
         }
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let queue = Arc::new(VoiceQueue::new(generation));
+        let queue = Arc::new(VoiceQueue::with_rewrite(generation, self.rewrite.clone()));
         *lock(&self.session) = Some(Arc::clone(&queue));
         let manager = Arc::clone(self);
         std::thread::spawn(move || manager.run(queue));
@@ -305,11 +310,15 @@ impl VoiceSessionManager {
     /// Every final phrase not yet on disk is written (fsync) now, before
     /// the loop can take its paste.
     fn journal_finals(&self, queue: &VoiceQueue, in_flight: &mut Vec<u64>) {
-        for (generation, phrase, text, target) in queue.take_unjournaled() {
-            match self
-                .journal
-                .phrase(generation, phrase, &text, target.as_ref())
-            {
+        for final_text in queue.take_unjournaled() {
+            let phrase = final_text.phrase;
+            match self.journal.phrase(
+                final_text.generation,
+                phrase,
+                &final_text.text,
+                final_text.raw.as_deref(),
+                final_text.target.as_ref(),
+            ) {
                 Ok(()) => in_flight.push(phrase),
                 Err(error) => log::error!("Voice phrase {phrase} not journaled: {error}"),
             }
@@ -353,7 +362,7 @@ impl VoiceSessionManager {
             // Phrase numbers start at 1, so 0 cannot collide.
             match self
                 .journal
-                .phrase(snapshot.generation, 0, &unfinished, None)
+                .phrase(snapshot.generation, 0, &unfinished, None, None)
             {
                 Ok(()) => in_flight.push(0),
                 Err(error) => log::error!("Voice unfinished text not journaled: {error}"),
@@ -383,7 +392,11 @@ impl VoiceSessionManager {
     /// Hyprland: the bar icon follows the session, the popup the journal.
     pub fn refresh_bar(&self, snapshot: Option<&Snapshot>) {
         if let Some(bar) = self.bar.get() {
-            bar.show(snapshot, &lock(&self.rescue));
+            bar.show(
+                snapshot,
+                &lock(&self.rescue),
+                &self.transcription.language(),
+            );
         }
     }
 
