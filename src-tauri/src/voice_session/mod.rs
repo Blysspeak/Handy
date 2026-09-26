@@ -238,12 +238,7 @@ impl VoiceSessionManager {
                     if result.is_ok() {
                         last_paste = Instant::now();
                     }
-                    self.journal_outcome(
-                        request.generation,
-                        request.phrase,
-                        &result,
-                        &mut in_flight,
-                    );
+                    self.journal_outcome(&request, &result, &mut in_flight);
                     queue.paste_done(request.generation, request.phrase, result);
                 }
             }
@@ -334,9 +329,9 @@ impl VoiceSessionManager {
         let Some(journal) = &self.journal else {
             return;
         };
-        for (generation, phrase, text) in queue.take_unjournaled() {
+        for (generation, phrase, text, target) in queue.take_unjournaled() {
             let id = journal.id(generation, phrase);
-            match journal.phrase(&id, &text) {
+            match journal.phrase(&id, &text, target.as_ref()) {
                 Ok(()) => in_flight.push(id),
                 Err(error) => log::error!("Voice phrase {phrase} not journaled: {error}"),
             }
@@ -345,23 +340,23 @@ impl VoiceSessionManager {
 
     fn journal_outcome(
         &self,
-        generation: u64,
-        phrase: u64,
+        request: &state::PasteRequest,
         result: &Result<(), String>,
         in_flight: &mut Vec<String>,
     ) {
         let Some(journal) = &self.journal else {
             return;
         };
-        let id = journal.id(generation, phrase);
+        let phrase = request.phrase;
+        let id = journal.id(request.generation, phrase);
         let before = in_flight.len();
         in_flight.retain(|pending| pending != &id);
         if in_flight.len() == before {
             return;
         }
         let written = match result {
-            Ok(()) => journal.delivered(&id),
-            Err(reason) => journal.failed(&id, reason),
+            Ok(()) => journal.delivered(&id, Some(&request.target)),
+            Err(reason) => journal.failed(&id, reason, Some(&request.target)),
         };
         if let Err(error) = written {
             log::error!("Voice phrase {phrase} outcome not journaled: {error}");
@@ -380,7 +375,7 @@ impl VoiceSessionManager {
         if !unfinished.is_empty() {
             // Phrase numbers start at 1, so 0 cannot collide.
             let id = journal.id(generation, 0);
-            match journal.phrase(&id, &unfinished) {
+            match journal.phrase(&id, &unfinished, None) {
                 Ok(()) => in_flight.push(id),
                 Err(error) => log::error!("Voice unfinished text not journaled: {error}"),
             }
@@ -390,7 +385,7 @@ impl VoiceSessionManager {
             .error
             .unwrap_or_else(|| "cancelled".to_string());
         for id in in_flight.drain(..) {
-            if let Err(error) = journal.failed(&id, &reason) {
+            if let Err(error) = journal.failed(&id, &reason, None) {
                 log::error!("Voice phrase outcome not journaled: {error}");
             }
         }
@@ -402,11 +397,14 @@ impl VoiceSessionManager {
         let Some(bar) = self.bar.get() else {
             return;
         };
-        let waiting = self
-            .journal
-            .as_ref()
-            .map(Journal::waiting)
-            .unwrap_or_default();
+        let waiting = match self.journal.as_ref().map(Journal::waiting) {
+            Some(Ok(waiting)) => waiting,
+            Some(Err(error)) => {
+                log::error!("Voice journal not readable: {error}");
+                Vec::new()
+            }
+            None => Vec::new(),
+        };
         bar.show(snapshot, &waiting, || {
             crate::settings::get_settings(&self.app).app_language
         });
@@ -450,7 +448,10 @@ impl VoiceSessionManager {
     /// copy (the overlay's "Copy draft" path); then it is marked copied.
     pub fn copy_waiting_text(&self) -> Result<usize, String> {
         let journal = self.journal.as_ref().ok_or("desktop")?;
-        let waiting = journal.waiting();
+        let waiting = journal.waiting().map_err(|error| {
+            log::error!("Voice journal not readable: {error}");
+            "desktop".to_string()
+        })?;
         if waiting.is_empty() {
             return Err("cancelled".into());
         }

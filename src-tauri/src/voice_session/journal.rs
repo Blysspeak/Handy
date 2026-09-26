@@ -1,196 +1,88 @@
 //! Durable record of every dictated phrase, so text survives a failed paste,
-//! a crash or a restart. Append-only JSON lines, fsync'd per write: a phrase
-//! is on disk before its paste is attempted, then marked delivered, failed
-//! (with the reason) or copied by the owner. Separate from history.db, whose
-//! schema is shared with older builds in the same data directory.
-use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+//! a crash or a restart. A phrase is committed to the `voice_phrases` table of
+//! history.db before its paste is attempted, then marked delivered or failed
+//! (with the reason); the owner's copy of rescued text sets `copied_at`.
+use super::state::{lock, Target};
+use rusqlite::{params, Connection, OptionalExtension};
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-pub const FILE_NAME: &str = "voice-journal.jsonl";
-/// Retention, applied when the journal is opened.
-const KEEP_MS: u64 = 14 * 24 * 60 * 60 * 1000;
-const KEEP_PHRASES: usize = 500;
+/// Retention, applied when the journal is opened: 30 days, newest 1000 phrases.
+const KEEP_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const KEEP_PHRASES: i64 = 1000;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-enum Record {
-    Phrase { id: String, at: u64, text: String },
-    Delivered { id: String, at: u64 },
-    Failed { id: String, at: u64, reason: String },
-    Copied { id: String, at: u64 },
-}
-
-impl Record {
-    fn id(&self) -> &str {
-        match self {
-            Self::Phrase { id, .. }
-            | Self::Delivered { id, .. }
-            | Self::Failed { id, .. }
-            | Self::Copied { id, .. } => id,
-        }
-    }
-}
+/// Created on every open, deliberately OUTSIDE the rusqlite_migration list in
+/// managers/history.rs: a migration would raise PRAGMA user_version past 4,
+/// and older builds sharing this data directory (the CachyOS install) then
+/// fail with DatabaseTooFarAhead and panic in HistoryManager::new
+/// (lib.rs: `.expect("Failed to initialize history manager")`). A table they
+/// do not know is invisible to them. Any future change to this table must stay
+/// backward compatible the same way: IF NOT EXISTS / additive, never versioned.
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS voice_phrases (
+    id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    target_app TEXT,
+    target_window TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'failed')),
+    reason TEXT,
+    delivered_at INTEGER,
+    copied_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS voice_phrases_rescue
+    ON voice_phrases (copied_at, status, created_at);
+";
 
 /// Text that no window has received and the owner has not copied yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Waiting {
     pub id: String,
-    pub at: u64,
+    pub at: i64,
     pub text: String,
     /// Paste refusal code, or "interrupted" for a phrase whose run ended
-    /// before any outcome was written (crash, kill, shutdown mid-paste).
+    /// before any outcome was written (crash, kill -9).
     pub reason: String,
 }
 
-struct Entry {
-    waiting: Waiting,
-    /// A delivered/failed/copied record exists.
-    settled: bool,
-    done: bool,
-}
-
 pub struct Journal {
-    path: PathBuf,
-    /// Prefix of this process's ids; unsettled phrases of other runs were interrupted.
+    connection: Mutex<Connection>,
+    /// Prefix of this process's ids; pending phrases of other runs were interrupted.
     run: String,
-    entries: Mutex<Vec<Entry>>,
 }
 
-fn now_ms() -> u64 {
+fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
-fn read(path: &Path) -> std::io::Result<Vec<Record>> {
-    let file = match File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    // A crash can leave a torn last line; every complete line still counts.
-    Ok(BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|line| serde_json::from_str(&line).ok())
-        .collect())
-}
-
-/// Phrases of the last KEEP_MS, at most KEEP_PHRASES, with their outcomes.
-fn retained(records: Vec<Record>, now: u64) -> Vec<Record> {
-    let phrases: Vec<&str> = records
-        .iter()
-        .filter_map(|record| match record {
-            Record::Phrase { id, at, .. } if now.saturating_sub(*at) <= KEEP_MS => {
-                Some(id.as_str())
-            }
-            _ => None,
-        })
-        .collect();
-    let keep: std::collections::HashSet<String> = phrases
-        .iter()
-        .rev()
-        .take(KEEP_PHRASES)
-        .map(|id| id.to_string())
-        .collect();
-    records
-        .into_iter()
-        .filter(|record| keep.contains(record.id()))
-        .collect()
+        .map_or(0, |d| d.as_millis() as i64)
 }
 
 impl Journal {
-    /// Opens `directory/voice-journal.jsonl`, applying retention.
-    pub fn open(directory: &Path) -> std::io::Result<Self> {
-        Self::open_at(directory, now_ms())
+    /// Opens `directory/history.db`, creating the table and applying retention.
+    pub fn open(directory: &Path) -> rusqlite::Result<Self> {
+        Self::open_at(&directory.join("history.db"), now_ms())
     }
 
-    fn open_at(directory: &Path, now: u64) -> std::io::Result<Self> {
-        std::fs::create_dir_all(directory)?;
-        let path = directory.join(FILE_NAME);
-        let all = read(&path)?;
-        let total = all.len();
-        let kept = retained(all, now);
-        if kept.len() != total {
-            Self::rewrite(&path, &kept)?;
-        }
-        let journal = Self {
-            path,
-            run: format!("{now}"),
-            entries: Mutex::new(Vec::new()),
-        };
-        {
-            let mut entries = super::state::lock(&journal.entries);
-            for record in &kept {
-                Self::index(&mut entries, record);
-            }
-        }
-        Ok(journal)
-    }
-
-    fn rewrite(path: &Path, records: &[Record]) -> std::io::Result<()> {
-        let temporary = path.with_extension("jsonl.tmp");
-        let mut file = File::create(&temporary)?;
-        for record in records {
-            writeln!(file, "{}", serde_json::to_string(record)?)?;
-        }
-        file.sync_all()?;
-        std::fs::rename(&temporary, path)?;
+    fn open_at(path: &Path, now: i64) -> rusqlite::Result<Self> {
         if let Some(directory) = path.parent() {
-            File::open(directory)?.sync_all()?;
+            let _ = std::fs::create_dir_all(directory);
         }
-        Ok(())
-    }
-
-    fn index(entries: &mut Vec<Entry>, record: &Record) {
-        match record {
-            Record::Phrase { id, at, text } => entries.push(Entry {
-                waiting: Waiting {
-                    id: id.clone(),
-                    at: *at,
-                    text: text.clone(),
-                    reason: "interrupted".into(),
-                },
-                settled: false,
-                done: false,
-            }),
-            Record::Delivered { id, .. } | Record::Copied { id, .. } => {
-                for entry in entries.iter_mut().filter(|e| &e.waiting.id == id) {
-                    entry.settled = true;
-                    entry.done = true;
-                }
-            }
-            Record::Failed { id, reason, .. } => {
-                for entry in entries.iter_mut().filter(|e| &e.waiting.id == id) {
-                    entry.settled = true;
-                    entry.waiting.reason = reason.clone();
-                }
-            }
-        }
-    }
-
-    fn append(&self, records: &[Record]) -> std::io::Result<()> {
-        let mut lines = String::new();
-        for record in records {
-            lines.push_str(&serde_json::to_string(record)?);
-            lines.push('\n');
-        }
-        // One writer at a time: the file and the index change together.
-        let mut entries = super::state::lock(&self.entries);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        file.write_all(lines.as_bytes())?;
-        file.sync_data()?;
-        for record in records {
-            Self::index(&mut entries, record);
-        }
-        Ok(())
+        let connection = Connection::open(path)?;
+        // History writes from the other connection must not fail our commit.
+        connection.busy_timeout(Duration::from_secs(2))?;
+        // A commit is on disk when it returns (rollback journal, file mode unchanged).
+        connection.pragma_update(None, "synchronous", "FULL")?;
+        connection.execute_batch(SCHEMA)?;
+        connection.execute(
+            "DELETE FROM voice_phrases WHERE created_at < ?1
+               OR id NOT IN (SELECT id FROM voice_phrases ORDER BY created_at DESC LIMIT ?2)",
+            params![now - KEEP_MS, KEEP_PHRASES],
+        )?;
+        Ok(Self {
+            connection: Mutex::new(connection),
+            run: now.to_string(),
+        })
     }
 
     /// Stable id of one phrase of one voice session in this process.
@@ -198,181 +90,291 @@ impl Journal {
         format!("{}-{generation}-{phrase}", self.run)
     }
 
-    /// On disk before this returns; call before any paste of the phrase.
-    pub fn phrase(&self, id: &str, text: &str) -> std::io::Result<()> {
-        self.append(&[Record::Phrase {
-            id: id.into(),
-            at: now_ms(),
-            text: text.into(),
-        }])
+    /// Committed before this returns; call before any paste of the phrase.
+    pub fn phrase(&self, id: &str, text: &str, target: Option<&Target>) -> rusqlite::Result<()> {
+        lock(&self.connection).execute(
+            "INSERT OR IGNORE INTO voice_phrases
+                 (id, created_at, text, target_app, target_window, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+            params![
+                id,
+                now_ms(),
+                text,
+                target.map(|t| &t.app_id),
+                target.map(|t| &t.id)
+            ],
+        )?;
+        Ok(())
     }
 
-    pub fn delivered(&self, id: &str) -> std::io::Result<()> {
-        self.append(&[Record::Delivered {
-            id: id.into(),
-            at: now_ms(),
-        }])
+    fn settle(
+        &self,
+        id: &str,
+        status: &str,
+        reason: Option<&str>,
+        target: Option<&Target>,
+    ) -> rusqlite::Result<()> {
+        let delivered_at = (status == "delivered").then(now_ms);
+        lock(&self.connection).execute(
+            "UPDATE voice_phrases SET status = ?2, reason = ?3, delivered_at = ?4,
+                 target_app = COALESCE(target_app, ?5), target_window = COALESCE(target_window, ?6)
+             WHERE id = ?1",
+            params![
+                id,
+                status,
+                reason,
+                delivered_at,
+                target.map(|t| &t.app_id),
+                target.map(|t| &t.id)
+            ],
+        )?;
+        Ok(())
     }
 
-    pub fn failed(&self, id: &str, reason: &str) -> std::io::Result<()> {
-        self.append(&[Record::Failed {
-            id: id.into(),
-            at: now_ms(),
-            reason: reason.into(),
-        }])
+    pub fn delivered(&self, id: &str, target: Option<&Target>) -> rusqlite::Result<()> {
+        self.settle(id, "delivered", None, target)
     }
 
-    pub fn copied(&self, ids: &[String]) -> std::io::Result<()> {
+    pub fn failed(&self, id: &str, reason: &str, target: Option<&Target>) -> rusqlite::Result<()> {
+        self.settle(id, "failed", Some(reason), target)
+    }
+
+    pub fn copied(&self, ids: &[String]) -> rusqlite::Result<()> {
+        let mut connection = lock(&self.connection);
+        let transaction = connection.transaction()?;
         let at = now_ms();
-        let records: Vec<_> = ids
-            .iter()
-            .map(|id| Record::Copied { id: id.clone(), at })
-            .collect();
-        self.append(&records)
+        for id in ids {
+            transaction.execute(
+                "UPDATE voice_phrases SET copied_at = ?2 WHERE id = ?1",
+                params![id, at],
+            )?;
+        }
+        transaction.commit()
     }
 
-    /// Oldest first: failed phrases, and phrases of earlier runs that never
-    /// got an outcome. This run's unsettled phrases are still being pasted.
-    pub fn waiting(&self) -> Vec<Waiting> {
-        let prefix = format!("{}-", self.run);
-        super::state::lock(&self.entries)
-            .iter()
-            .filter(|e| !e.done && (e.settled || !e.waiting.id.starts_with(&prefix)))
-            .map(|e| e.waiting.clone())
-            .collect()
+    /// Oldest first: failed phrases, and pending phrases of earlier runs that
+    /// never got an outcome. This run's pending phrases are still being pasted.
+    pub fn waiting(&self) -> rusqlite::Result<Vec<Waiting>> {
+        let connection = lock(&self.connection);
+        let mut statement = connection.prepare_cached(
+            "SELECT id, created_at, text, status, reason FROM voice_phrases
+             WHERE copied_at IS NULL
+               AND (status = 'failed' OR (status = 'pending' AND id NOT LIKE ?1))
+             ORDER BY created_at, rowid",
+        )?;
+        let rows = statement.query_map(params![format!("{}-%", self.run)], |row| {
+            let status: String = row.get(3)?;
+            let reason: Option<String> = row.get(4)?;
+            Ok(Waiting {
+                id: row.get(0)?,
+                at: row.get(1)?,
+                text: row.get(2)?,
+                reason: if status == "pending" {
+                    "interrupted".into()
+                } else {
+                    reason.unwrap_or_else(|| "model".into())
+                },
+            })
+        })?;
+        rows.collect()
+    }
+
+    #[cfg(test)]
+    fn status(&self, id: &str) -> Option<(String, Option<String>, Option<String>)> {
+        lock(&self.connection)
+            .query_row(
+                "SELECT status, reason, target_app FROM voice_phrases WHERE id = ?1",
+                params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn directory(name: &str) -> PathBuf {
+    fn database(name: &str) -> PathBuf {
         let directory =
             std::env::temp_dir().join(format!("diktor-journal-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
-        directory
+        std::fs::create_dir_all(&directory).unwrap();
+        directory.join("history.db")
+    }
+
+    fn target(id: &str) -> Target {
+        Target {
+            id: id.into(),
+            app_id: "foot".into(),
+            pid: 7,
+            output: "DP-1".into(),
+            output_x: 0,
+            output_y: 0,
+        }
+    }
+
+    fn texts(journal: &Journal) -> Vec<(String, String)> {
+        journal
+            .waiting()
+            .unwrap()
+            .into_iter()
+            .map(|w| (w.text, w.reason))
+            .collect()
     }
 
     #[test]
-    fn voice_journal_phrase_is_on_disk_before_any_outcome() {
-        let dir = directory("write");
-        let journal = Journal::open_at(&dir, 1_000).unwrap();
+    fn voice_journal_leaves_history_schema_and_user_version_alone() {
+        let path = database("schema");
+        {
+            // What a 13.09 build leaves behind: four migrations applied.
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE transcription_history (id INTEGER PRIMARY KEY, title TEXT);
+                     INSERT INTO transcription_history (title) VALUES ('старая запись');
+                     PRAGMA user_version = 4;",
+                )
+                .unwrap();
+        }
+        Journal::open_at(&path, 1_000).unwrap();
+        Journal::open_at(&path, 2_000).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        let version: i32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let title: String = connection
+            .query_row("SELECT title FROM transcription_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(title, "старая запись");
+        let mode: String = connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn voice_journal_phrase_is_committed_before_any_outcome() {
+        let path = database("write");
+        let journal = Journal::open_at(&path, 1_000).unwrap();
         let id = journal.id(1, 1);
-        journal.phrase(&id, "первая фраза").unwrap();
-        let on_disk = std::fs::read_to_string(dir.join(FILE_NAME)).unwrap();
-        assert!(on_disk.contains("первая фраза"));
+        journal
+            .phrase(&id, "первая фраза", Some(&target("0xA")))
+            .unwrap();
+        // Visible to a second connection: committed, not just buffered.
+        let text: String = Connection::open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT text FROM voice_phrases WHERE status = 'pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(text, "первая фраза");
         // In flight in this run: not offered for rescue yet.
-        assert!(journal.waiting().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(journal.waiting().unwrap().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn voice_journal_marks_delivered_failed_and_copied() {
-        let dir = directory("mark");
-        let journal = Journal::open_at(&dir, 1_000).unwrap();
+        let path = database("mark");
+        let journal = Journal::open_at(&path, 1_000).unwrap();
         let (a, b, c) = (journal.id(1, 1), journal.id(1, 2), journal.id(1, 3));
-        journal.phrase(&a, "доставлена").unwrap();
-        journal.delivered(&a).unwrap();
-        journal.phrase(&b, "не вставилась").unwrap();
-        journal.failed(&b, "target_changed").unwrap();
-        journal.phrase(&c, "вторая неудача").unwrap();
-        journal.failed(&c, "cancelled").unwrap();
-        let waiting = journal.waiting();
+        journal.phrase(&a, "доставлена", None).unwrap();
+        journal.delivered(&a, Some(&target("0xA"))).unwrap();
+        journal.phrase(&b, "не вставилась", None).unwrap();
+        journal
+            .failed(&b, "target_changed", Some(&target("0xB")))
+            .unwrap();
+        journal.phrase(&c, "вторая неудача", None).unwrap();
+        journal.failed(&c, "cancelled", None).unwrap();
         assert_eq!(
-            waiting
-                .iter()
-                .map(|w| (w.text.as_str(), w.reason.as_str()))
-                .collect::<Vec<_>>(),
+            journal.status(&a),
+            Some(("delivered".into(), None, Some("foot".into())))
+        );
+        assert_eq!(
+            texts(&journal),
             [
-                ("не вставилась", "target_changed"),
-                ("вторая неудача", "cancelled")
+                ("не вставилась".into(), "target_changed".into()),
+                ("вторая неудача".into(), "cancelled".into())
             ]
         );
         journal.copied(&[b.clone(), c.clone()]).unwrap();
-        assert!(journal.waiting().is_empty());
-        std::fs::remove_dir_all(dir).unwrap();
+        assert!(journal.waiting().unwrap().is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn voice_journal_recovers_failed_and_interrupted_after_restart() {
-        let dir = directory("recover");
+        let path = database("recover");
         {
-            let journal = Journal::open_at(&dir, 1_000).unwrap();
+            let journal = Journal::open_at(&path, 1_000).unwrap();
             let (a, b) = (journal.id(4, 1), journal.id(4, 2));
-            journal.phrase(&a, "упала вставка").unwrap();
-            journal.failed(&a, "target_changed").unwrap();
-            // Killed between the durable write and the paste.
-            journal.phrase(&b, "процесс убит").unwrap();
+            journal.phrase(&a, "упала вставка", None).unwrap();
+            journal.failed(&a, "target_changed", None).unwrap();
+            // Killed between the committed write and the paste.
+            journal.phrase(&b, "процесс убит", None).unwrap();
         }
-        // A crash can tear the last line; complete lines still count.
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(dir.join(FILE_NAME))
-            .unwrap();
-        file.write_all(b"{\"event\":\"delivered\",\"id\":\"1000-4-")
-            .unwrap();
-        drop(file);
-        let journal = Journal::open_at(&dir, 2_000).unwrap();
-        let waiting = journal.waiting();
+        let journal = Journal::open_at(&path, 2_000).unwrap();
         assert_eq!(
-            waiting
-                .iter()
-                .map(|w| (w.text.as_str(), w.reason.as_str()))
-                .collect::<Vec<_>>(),
+            texts(&journal),
             [
-                ("упала вставка", "target_changed"),
-                ("процесс убит", "interrupted")
+                ("упала вставка".into(), "target_changed".into()),
+                ("процесс убит".into(), "interrupted".into())
             ]
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
     fn voice_journal_retention_drops_old_and_excess_phrases() {
-        let dir = directory("retention");
+        let path = database("retention");
         {
-            let journal = Journal::open_at(&dir, 1_000).unwrap();
-            journal
-                .append(&[
-                    Record::Phrase {
-                        id: "old".into(),
-                        at: 1_000,
-                        text: "старое".into(),
-                    },
-                    Record::Failed {
-                        id: "old".into(),
-                        at: 1_000,
-                        reason: "target_changed".into(),
-                    },
-                ])
+            let journal = Journal::open_at(&path, 1_000).unwrap();
+            let connection = lock(&journal.connection);
+            connection
+                .execute(
+                    "INSERT INTO voice_phrases (id, created_at, text, status, reason)
+                     VALUES ('old', 1000, 'старое', 'failed', 'target_changed')",
+                    [],
+                )
                 .unwrap();
             for n in 0..KEEP_PHRASES + 2 {
-                let id = format!("new-{n}");
-                journal
-                    .append(&[
-                        Record::Phrase {
-                            id: id.clone(),
-                            at: KEEP_MS + 5_000,
-                            text: format!("фраза {n}"),
-                        },
-                        Record::Delivered {
-                            id,
-                            at: KEEP_MS + 5_000,
-                        },
-                    ])
+                connection
+                    .execute(
+                        "INSERT INTO voice_phrases (id, created_at, text, status)
+                         VALUES (?1, ?2, 'фраза', 'delivered')",
+                        params![format!("new-{n}"), KEEP_MS + 5_000 + n],
+                    )
                     .unwrap();
             }
         }
-        let journal = Journal::open_at(&dir, KEEP_MS + 10_000).unwrap();
-        assert!(journal.waiting().is_empty());
-        let records = read(&dir.join(FILE_NAME)).unwrap();
-        let phrases = records
-            .iter()
-            .filter(|r| matches!(r, Record::Phrase { .. }))
-            .count();
-        assert_eq!(phrases, KEEP_PHRASES);
-        assert!(records.iter().all(|r| r.id() != "old" && r.id() != "new-0"));
-        std::fs::remove_dir_all(dir).unwrap();
+        let journal = Journal::open_at(&path, KEEP_MS + 10_000).unwrap();
+        assert!(journal.waiting().unwrap().is_empty());
+        let connection = lock(&journal.connection);
+        let (count, oldest): (i64, String) = connection
+            .query_row(
+                "SELECT COUNT(*), MIN(id) FROM voice_phrases WHERE id LIKE 'new-%'
+                   AND created_at = (SELECT MIN(created_at) FROM voice_phrases)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(oldest, "new-2");
+        let total: i64 = connection
+            .query_row("SELECT COUNT(*) FROM voice_phrases", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, KEEP_PHRASES);
+        drop(connection);
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

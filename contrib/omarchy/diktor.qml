@@ -5,7 +5,8 @@
 // State comes from $XDG_RUNTIME_DIR/diktor/voice-state.json, which Diktor
 // replaces atomically (voice_session/bar_state.rs): {state, tooltip}.
 // Left click toggles voice mode, or copies text that was never inserted while
-// some is waiting (voice-journal.jsonl); middle click always toggles.
+// some is waiting (voice_phrases in history.db); right click copies it at any
+// time, middle click always toggles.
 import QtQuick
 import Quickshell
 import Quickshell.Io
@@ -68,8 +69,10 @@ Item {
     tooltipText: root.tooltip ? "Diktor\n" + root.tooltip : "Diktor"
     onPressed: function(b) {
       if (!root.bar) return
-      if (b === Qt.LeftButton && root.voiceState === "waiting") root.bar.run(root.handy + " --copy-voice-text")
-      else if (b === Qt.LeftButton || b === Qt.MiddleButton) root.bar.run(root.handy + " --toggle-voice-mode")
+      var waiting = root.voiceState === "waiting"
+      if (b === Qt.RightButton || (b === Qt.LeftButton && waiting)) {
+        if (waiting) root.bar.run(root.handy + " --copy-voice-text")
+      } else root.bar.run(root.handy + " --toggle-voice-mode")
     }
   }
 

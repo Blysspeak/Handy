@@ -591,7 +591,7 @@ impl VoiceQueue {
     /// Final phrase texts not yet in the durable journal, oldest first. The
     /// caller writes them before taking the next paste, so no paste precedes
     /// its journal line. Works after the session stopped too.
-    pub fn take_unjournaled(&self) -> Vec<(u64, u64, String)> {
+    pub fn take_unjournaled(&self) -> Vec<(u64, u64, String, Option<Target>)> {
         let mut s = lock(&self.inner);
         let generation = s.snapshot.generation;
         s.pending
@@ -600,7 +600,7 @@ impl VoiceQueue {
             .filter_map(|p| {
                 let text = p.text.clone().filter(|text| !text.trim().is_empty())?;
                 p.journaled = true;
-                Some((generation, p.phrase, text))
+                Some((generation, p.phrase, text, p.target.clone()))
             })
             .collect()
     }
@@ -1448,7 +1448,10 @@ mod tests {
         automatic_commit(&q, "A");
         assert!(q.take_unjournaled().is_empty());
         q.finalized(7, 1, "первая".into());
-        assert_eq!(q.take_unjournaled(), [(7, 1, "первая".to_string())]);
+        assert_eq!(
+            q.take_unjournaled(),
+            [(7, 1, "первая".to_string(), Some(target("A")))]
+        );
         assert!(q.take_unjournaled().is_empty());
         // Dropped noise is never journaled.
         q.speech_activity(true);

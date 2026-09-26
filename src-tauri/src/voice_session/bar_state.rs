@@ -227,7 +227,7 @@ mod tests {
             .enumerate()
             .map(|(n, text)| Waiting {
                 id: format!("run-1-{n}"),
-                at: n as u64,
+                at: n as i64,
                 text: text.to_string(),
                 reason: "target_changed".into(),
             })
