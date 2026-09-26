@@ -6,6 +6,7 @@ mod audio_toolkit;
 mod cli_terms;
 mod config;
 mod engine;
+mod fuzzy;
 mod glossary;
 mod ipc;
 mod journal;
@@ -296,12 +297,29 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
     );
     transcriber.load_in_background();
     let glossary = Arc::new(glossary::Glossary::new(Arc::clone(&journal)));
+    let terms = config.fuzzy_terms.then(|| {
+        vocabulary::Live::new(
+            Arc::clone(&journal),
+            config
+                .vocabulary_dirs
+                .iter()
+                .map(|d| vocabulary::expand(d))
+                .collect(),
+            config.vocabulary_skip.clone(),
+        )
+    });
     let manager = voice_session::VoiceSessionManager::new(
         audio,
         Arc::clone(&transcriber),
         Arc::clone(&journal),
         runtime,
-        Some(Arc::new(move |text: &str| glossary.apply(text))),
+        Some(Arc::new(move |text: &str| {
+            let text = glossary.apply(text);
+            match &terms {
+                Some(terms) => terms.apply(&text),
+                None => text,
+            }
+        })),
     );
     manager.initialize();
 

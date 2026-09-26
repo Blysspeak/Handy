@@ -35,6 +35,11 @@ log_level = "info"
 vocabulary_dirs = ["~/workSpace/project"]
 vocabulary_skip = ["src", "archive", "spec-kit"]
 
+# After the glossary, Cyrillic words that sound like one of those terms are
+# written as the term («хайпрленд» → Hyprland, «клауда» → Claude'а). Short
+# words (under 5 letters) are never touched; the raw text stays in diktor.db.
+fuzzy_terms = true
+
 # Glossary entries Claude adds (`diktor glossary add --source claude`): "auto"
 # applies them at once, "suggest" keeps them pending until
 # `diktor glossary approve <spoken>`.

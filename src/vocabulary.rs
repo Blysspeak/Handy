@@ -87,6 +87,53 @@ pub fn effective(
     Ok(terms)
 }
 
+/// The fuzzy index over the effective vocabulary, rebuilt when the manual
+/// list changes (table version) or every few minutes (project directories).
+pub struct Live {
+    journal: std::sync::Arc<Journal>,
+    dirs: Vec<PathBuf>,
+    skip: Vec<String>,
+    loaded: std::sync::Mutex<Option<(i64, std::time::Instant, crate::fuzzy::Index)>>,
+}
+
+const RESCAN: std::time::Duration = std::time::Duration::from_secs(300);
+
+impl Live {
+    pub fn new(journal: std::sync::Arc<Journal>, dirs: Vec<PathBuf>, skip: Vec<String>) -> Self {
+        Self {
+            journal,
+            dirs,
+            skip,
+            loaded: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub fn apply(&self, text: &str) -> String {
+        let version = self.journal.vocabulary_version().unwrap_or(-1);
+        let mut loaded = crate::voice_session::state::lock(&self.loaded);
+        let stale = loaded
+            .as_ref()
+            .is_none_or(|(v, at, _)| *v != version || at.elapsed() > RESCAN);
+        if stale {
+            match effective(&self.journal, &self.dirs, &self.skip) {
+                Ok(terms) => {
+                    log::info!("Vocabulary: {} terms for the fuzzy layer", terms.len());
+                    *loaded = Some((
+                        version,
+                        std::time::Instant::now(),
+                        crate::fuzzy::Index::new(&terms),
+                    ));
+                }
+                Err(error) => log::warn!("Vocabulary not loaded: {error:#}"),
+            }
+        }
+        match loaded.as_ref() {
+            Some((_, _, index)) => index.apply(text),
+            None => text.to_string(),
+        }
+    }
+}
+
 /// `~` expanded.
 pub fn expand(path: &str) -> PathBuf {
     match path.strip_prefix("~/") {

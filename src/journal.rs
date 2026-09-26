@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS phrases (
 CREATE INDEX IF NOT EXISTS phrases_waiting ON phrases (status, copied_at, dismissed_at);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 INSERT OR IGNORE INTO meta (key, value) VALUES ('glossary_version', 0);
+INSERT OR IGNORE INTO meta (key, value) VALUES ('vocabulary_version', 0);
 CREATE TABLE IF NOT EXISTS glossary (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     from_text TEXT NOT NULL,
@@ -73,6 +74,12 @@ CREATE TABLE IF NOT EXISTS tts (
     voice TEXT NOT NULL,
     speed REAL NOT NULL
 );
+CREATE TRIGGER IF NOT EXISTS vocabulary_insert AFTER INSERT ON vocabulary
+    BEGIN UPDATE meta SET value = value + 1 WHERE key = 'vocabulary_version'; END;
+CREATE TRIGGER IF NOT EXISTS vocabulary_update AFTER UPDATE ON vocabulary
+    BEGIN UPDATE meta SET value = value + 1 WHERE key = 'vocabulary_version'; END;
+CREATE TRIGGER IF NOT EXISTS vocabulary_delete AFTER DELETE ON vocabulary
+    BEGIN UPDATE meta SET value = value + 1 WHERE key = 'vocabulary_version'; END;
 PRAGMA user_version = 3;
 ";
 
@@ -261,6 +268,15 @@ impl Journal {
     pub fn glossary_version(&self) -> rusqlite::Result<i64> {
         lock(&self.connection).query_row(
             "SELECT value FROM meta WHERE key = 'glossary_version'",
+            [],
+            |row| row.get(0),
+        )
+    }
+
+    /// Bumped by triggers on every vocabulary change.
+    pub fn vocabulary_version(&self) -> rusqlite::Result<i64> {
+        lock(&self.connection).query_row(
+            "SELECT value FROM meta WHERE key = 'vocabulary_version'",
             [],
             |row| row.get(0),
         )

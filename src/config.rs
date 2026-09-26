@@ -31,6 +31,9 @@ pub struct Config {
     pub vocabulary_dirs: Vec<String>,
     /// Subdirectory names too generic to be terms.
     pub vocabulary_skip: Vec<String>,
+    /// After the glossary, write Cyrillic words that sound like a vocabulary
+    /// term as that term («хайпрленд» → Hyprland).
+    pub fuzzy_terms: bool,
     /// `auto`: Claude's glossary additions apply at once; `suggest`: they wait
     /// for `diktor glossary approve`.
     pub claude_glossary: String,
@@ -51,6 +54,7 @@ impl Default for Config {
             log_level: "info".into(),
             vocabulary_dirs: vec!["~/workSpace/project".into()],
             vocabulary_skip: vec!["src".into(), "archive".into(), "spec-kit".into()],
+            fuzzy_terms: true,
             claude_glossary: "auto".into(),
             tts: crate::tts::TtsConfig::default(),
         }
