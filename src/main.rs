@@ -78,6 +78,12 @@ enum Command {
         #[command(subcommand)]
         action: cli_terms::VocabAction,
     },
+    /// What the glossary and the fuzzy layer make of TEXT (no dictation).
+    Rewrite {
+        text: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Latin/all-caps tokens in recognised text that no glossary entry covers.
     Misses {
         #[arg(long, default_value_t = 30)]
@@ -193,6 +199,7 @@ fn main() -> ExitCode {
         Command::Phrases { action } => cli_terms::phrases_command(action),
         Command::Vocab { action } => cli_terms::vocab_command(action),
         Command::Misses { days, json } => cli_terms::misses_command(days, json),
+        Command::Rewrite { text, json } => cli_terms::rewrite_command(&text, json),
         Command::Say {
             text,
             voice,

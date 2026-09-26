@@ -160,7 +160,7 @@ fn starts_upper(word: &str) -> bool {
 
 /// The written form, capitalised only at a sentence start where the spoken
 /// word was capitalised.
-fn cased(spoken: &str, written: &str, at_sentence_start: bool) -> String {
+pub fn cased(spoken: &str, written: &str, at_sentence_start: bool) -> String {
     if at_sentence_start && starts_upper(spoken) {
         capitalise(written)
     } else {
@@ -170,7 +170,7 @@ fn cased(spoken: &str, written: &str, at_sentence_start: bool) -> String {
 
 /// Nothing but spaces (and opening quotes/brackets) since the text start or
 /// the last sentence end.
-fn sentence_start(before: &str) -> bool {
+pub fn sentence_start(before: &str) -> bool {
     let trimmed = before.trim_end_matches(|c: char| c.is_whitespace() || "«\"'(„“[".contains(c));
     trimmed.is_empty() || trimmed.ends_with(['.', '!', '?', '…'])
 }

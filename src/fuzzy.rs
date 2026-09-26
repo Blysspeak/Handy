@@ -250,7 +250,9 @@ impl Index {
                             })
                         });
                     if let Some((term, ending)) = found {
-                        out.push_str(term);
+                        let spoken = &tokens[i].text;
+                        let at_start = crate::glossary::sentence_start(&out);
+                        out.push_str(&crate::glossary::cased(spoken, term, at_start));
                         out.push_str(&ending);
                         i = run.end;
                         replaced = true;
@@ -403,6 +405,11 @@ mod tests {
         assert_eq!(g.apply("новый бранч"), "новый branch");
         assert_eq!(g.apply("это немотрон"), "это Nemotron");
         assert_eq!(g.apply("в телеграм"), "в Telegram");
+        // Heard on the Kokoro clip "Deploy the branch and tell Telegram" (language ru).
+        assert_eq!(
+            g.apply("Депло брат тел Телеграм"),
+            "Deploy брат тел Telegram"
+        );
         assert_eq!(g.apply("спроси клауда"), "спроси Claude'а");
         assert_eq!(g.apply("пул реквест"), "pull request");
         assert_eq!(g.apply("Хайпер Ланд упал"), "Hyprland упал");
@@ -433,6 +440,7 @@ mod tests {
         let g = owner();
         assert_eq!(g.apply("Hyprland, Claude: ok!"), "Hyprland, Claude: ok!");
         assert_eq!(g.apply("Хайпрленд, клауд."), "Hyprland, Claude.");
+        assert_eq!(g.apply("Ок. Деплой готов"), "Ок. Deploy готов");
         assert_eq!(Index::new(&[]).apply("хайпрленд"), "хайпрленд");
     }
 

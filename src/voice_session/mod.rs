@@ -359,10 +359,13 @@ impl VoiceSessionManager {
         let snapshot = queue.snapshot();
         let unfinished = queue.unfinished_text();
         if !unfinished.is_empty() {
+            // The rescue copy gets the glossary too; the raw text stays beside it.
+            let text = queue.rewrite(&unfinished);
+            let raw = (text != unfinished).then_some(unfinished.as_str());
             // Phrase numbers start at 1, so 0 cannot collide.
             match self
                 .journal
-                .phrase(snapshot.generation, 0, &unfinished, None, None)
+                .phrase(snapshot.generation, 0, &text, raw, None)
             {
                 Ok(()) => in_flight.push(0),
                 Err(error) => log::error!("Voice unfinished text not journaled: {error}"),

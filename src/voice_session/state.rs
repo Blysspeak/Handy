@@ -642,6 +642,14 @@ impl VoiceQueue {
             .collect()
     }
 
+    /// The glossary (when there is one) applied to `text`.
+    pub fn rewrite(&self, text: &str) -> String {
+        match &self.rewrite {
+            Some(rewrite) => sanitize(&rewrite(text)),
+            None => text.to_string(),
+        }
+    }
+
     /// Speech recognised but never finalised when the session stopped:
     /// committed phrases still decoding plus the phrase being captured.
     pub fn unfinished_text(&self) -> String {
@@ -1521,6 +1529,8 @@ mod tests {
         assert_eq!(journal[0].text, "сделай commit");
         assert_eq!(journal[0].raw.as_deref(), Some("сделай коммит"));
         assert_eq!(q.take_paste().unwrap().text, "сделай commit");
+        // Text still being decoded at stop goes through the same rewrite.
+        assert_eq!(q.rewrite("один коммит"), "один commit");
     }
 
     #[test]

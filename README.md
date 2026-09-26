@@ -44,6 +44,7 @@ diktor glossary add --stem "икс хаб" xhub     # имя: падежи и п
 diktor glossary remove камит
 diktor glossary approve гпт                   # принять предложение Claude (claude_glossary = "suggest")
 diktor misses [--days 30]                     # латиница/КАПС в распознанном, чего нет в словаре
+diktor rewrite "открой хайпрленд"             # что сделают словарь и нечёткий слой с текстом
 diktor phrases recent [--limit 20]            # распознано / вставлено / статус
 diktor phrases search камит
 diktor phrases correct <id> "правильный текст"

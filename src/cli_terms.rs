@@ -323,6 +323,35 @@ pub fn vocab_command(action: VocabAction) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// `diktor rewrite TEXT`: what the glossary and the fuzzy layer make of a
+/// recognised text, without dictating (for checking an entry before adding it).
+pub fn rewrite_command(text: &str, json: bool) -> anyhow::Result<ExitCode> {
+    let (journal, config) = open()?;
+    let journal = std::sync::Arc::new(journal);
+    let glossary = glossary::Glossary::new(std::sync::Arc::clone(&journal));
+    let after_glossary = glossary.apply(text);
+    let dirs: Vec<_> = config
+        .vocabulary_dirs
+        .iter()
+        .map(|d| vocabulary::expand(d))
+        .collect();
+    let final_text = if config.fuzzy_terms {
+        let terms = vocabulary::effective(&journal, &dirs, &config.vocabulary_skip)?;
+        crate::fuzzy::Index::new(&terms).apply(&after_glossary)
+    } else {
+        after_glossary.clone()
+    };
+    if json {
+        return print_json(
+            &json!({ "raw": text, "glossary": after_glossary, "final": final_text }),
+        );
+    }
+    println!("распознано: {text}");
+    println!("словарь:    {after_glossary}");
+    println!("итог:       {final_text}");
+    Ok(ExitCode::SUCCESS)
+}
+
 #[derive(Serialize)]
 struct MissJson {
     token: String,
