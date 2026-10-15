@@ -1,0 +1,19 @@
+# ~/.config/systemd/user/diktor.service — installed by scripts/install.sh.
+[Unit]
+Description=Diktor: real-time voice input (headless daemon)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Through the symlink: a new install repoints ~/.local/bin/diktor, the unit
+# stays as it is.
+ExecStart=%h/.local/bin/diktor daemon
+Restart=on-failure
+RestartSec=5
+# SIGTERM: voice off, unsent text to the journal, helper restores follow_mouse.
+TimeoutStopSec=10
+Slice=app.slice
+
+[Install]
+WantedBy=graphical-session.target

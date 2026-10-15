@@ -1,0 +1,55 @@
+# Diktor configuration: ~/.config/diktor/config.toml
+# Every key is optional; the values below are the defaults. The daemon reads
+# this file at start: `systemctl --user restart diktor` after editing.
+
+# Streaming speech model (GGUF). Either a path (~ allowed) or a bare file name
+# looked up in ~/.local/share/diktor/models/ and then, read only, in
+# ~/.local/share/com.pais.handy/models/.
+model = "nemotron-3.5-asr-streaming-0.6b-Q8_0.gguf"
+
+# Recognition language as the model names it ("ru", "en", ...) or "auto":
+# the model detects the language of every phrase (Russian and English both).
+# `diktor lang ru|en|auto` changes it from the next phrase on and saves it here.
+language = "auto"
+
+# Microphone: "default" follows the system default input; otherwise a name
+# printed by `diktor devices`.
+input_device = "default"
+
+# Compute backend for the model: "auto" (GPU when available), "vulkan", "cpu".
+backend = "auto"
+
+# Silero VAD model; empty uses the copy installed with the binary.
+vad_model = ""
+
+# Phrase journal (~/.local/share/diktor/diktor.db) keeps at most this many
+# days and this many newest phrases.
+keep_days = 30
+keep_phrases = 1000
+
+# "error", "warn", "info" or "debug". Debug also logs recognised text.
+log_level = "info"
+
+# Vocabulary: names of the subdirectories here are terms too (xhub-devbot is
+# also "xhub devbot"); `diktor vocab list` shows the effective list.
+vocabulary_dirs = ["~/workSpace/project"]
+vocabulary_skip = ["src", "archive", "spec-kit"]
+
+# After the glossary, Cyrillic words that sound like one of those terms are
+# written as the term («хайпрленд» → Hyprland, «клауда» → Claude'а). Short
+# words (under 5 letters) are never touched; the raw text stays in diktor.db.
+fuzzy_terms = true
+
+# Glossary entries Claude adds (`diktor glossary add --source claude`): "auto"
+# applies them at once, "suggest" keeps them pending until
+# `diktor glossary approve <spoken>`.
+claude_glossary = "auto"
+
+# `diktor say`: text to speech (English lessons). While diktor speaks, voice
+# mode hears silence, so its own voice is never typed.
+[tts]
+engine = "kokoro"
+voice = "bm_fable"
+speed = 0.95
+kokoro_helper = "~/.local/bin/say-en"
+kokoro_home = "~/.local/share/kokoro"

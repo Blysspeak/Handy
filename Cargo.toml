@@ -1,0 +1,38 @@
+[package]
+name = "diktor"
+version = "0.1.0"
+description = "Diktor: headless real-time voice input for Hyprland (daemon + CLI)"
+authors = ["cjpais", "blyss"]
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0.95"
+clap = { version = "4", features = ["derive"] }
+cpal = "0.16.0"
+env_logger = "0.10"
+hound = "3.5.1"
+libc = "0.2"
+log = "0.4.25"
+regex = "1"
+rubato = "0.16.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+rustfft = "6.4.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+signal-hook = "0.3"
+toml = "0.9"
+vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
+# Same posture as the Handy fork on Linux: shared libtranscribe plus loadable
+# ggml modules (per-ISA CPU and Vulkan), shipped next to the binary.
+transcribe-cpp = { version = "0.2.0", default-features = false, features = [
+  "dynamic-backends",
+  "vulkan",
+] }
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+panic = "unwind"

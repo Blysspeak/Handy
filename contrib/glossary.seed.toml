@@ -1,0 +1,23 @@
+# Diktor glossary: spoken form (as recognised) = written form.
+# Top-level entries are exact words; entries under [stems] also take Russian
+# case endings and a glued preposition: иксхаба -> xhub'а, схабом -> с xhub'ом.
+# Edit by hand or with `diktor glossary add [--stem] <spoken> <written>`.
+# `diktor glossary misses` lists new candidates from the phrase journal.
+"камит" = "commit"
+"коммит" = "commit"
+"xhab" = "xhub"
+"xhpsp" = "xhub"
+
+[stems]
+"фейбл" = "Fable"
+"хайпер ланд" = "Hyprland"
+"хайпрленд" = "Hyprland"
+"клауд" = "Claude"
+"клод" = "Claude"
+"иксхаб" = "xhub"
+"иксхап" = "xhub"
+"икс хаб" = "xhub"
+# Owner-specific trade-off: in his speech a bare «хаб» means X-Hub, so every
+# «хаб» (and «с хабом», «хабе»...) becomes xhub. Remove this line if that is
+# ever wrong; the raw text stays in diktor.db either way.
+"хаб" = "xhub"
