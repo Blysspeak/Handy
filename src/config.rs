@@ -37,8 +37,6 @@ pub struct Config {
     /// `auto`: Claude's glossary additions apply at once; `suggest`: they wait
     /// for `diktor glossary approve`.
     pub claude_glossary: String,
-    /// `diktor say`: engine, voice, speed.
-    pub tts: crate::tts::TtsConfig,
 }
 
 impl Default for Config {
@@ -56,7 +54,6 @@ impl Default for Config {
             vocabulary_skip: vec!["src".into(), "archive".into(), "spec-kit".into()],
             fuzzy_terms: true,
             claude_glossary: "auto".into(),
-            tts: crate::tts::TtsConfig::default(),
         }
     }
 }
@@ -317,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn values_land_in_their_table_and_keep_comments() {
+    fn values_land_at_the_top_level_and_keep_comments() {
         let directory =
             std::env::temp_dir().join(format!("diktor-config-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
@@ -325,42 +322,32 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             &path,
-            "# top\nlanguage = \"ru\"\n\n# voice\n[tts]\nvoice = \"bm_fable\"\n",
+            "# top\nlanguage = \"ru\"\n\n# model\nkeep_days = 30\n",
         )
         .unwrap();
-        save_value(&path, Some("tts"), "speed", toml::Value::Float(0.8)).unwrap();
-        save_value(
-            &path,
-            Some("tts"),
-            "voice",
-            toml::Value::String("am_michael".into()),
-        )
-        .unwrap();
+        save_value(&path, None, "keep_days", toml::Value::Integer(7)).unwrap();
         save_value(&path, None, "model", toml::Value::String("x.gguf".into())).unwrap();
         let config = Config::load(&path).unwrap();
         assert_eq!(
-            (config.tts.voice.as_str(), config.tts.speed),
-            ("am_michael", 0.8)
-        );
-        assert_eq!(
-            (config.model.as_str(), config.language.as_str()),
-            ("x.gguf", "ru")
+            (
+                config.model.as_str(),
+                config.language.as_str(),
+                config.keep_days
+            ),
+            ("x.gguf", "ru", 7)
         );
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("# top\nlanguage = \"ru\"\nmodel = \"x.gguf\"\n\n# voice\n[tts]"));
-        // A missing table is appended.
-        std::fs::write(&path, "language = \"ru\"\n").unwrap();
-        save_value(
-            &path,
-            Some("tts"),
-            "voice",
-            toml::Value::String("af_heart".into()),
-        )
-        .unwrap();
-        assert_eq!(Config::load(&path).unwrap().tts.voice, "af_heart");
+        assert!(text.starts_with("# top\nlanguage = \"ru\"\n\n# model\nkeep_days = 7\n"));
+        // A new key lands after the last one, before the trailing comment.
+        std::fs::write(&path, "language = \"ru\"\n\n# mine\n").unwrap();
+        save_value(&path, None, "model", toml::Value::String("y.gguf".into())).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "language = \"ru\"\nmodel = \"y.gguf\"\n\n# mine\n"
+        );
         // Something that does not parse is not written.
         assert!(save_value(&path, None, "keep_days", toml::Value::String("x".into())).is_err());
-        assert_eq!(Config::load(&path).unwrap().tts.voice, "af_heart");
+        assert_eq!(Config::load(&path).unwrap().model, "y.gguf");
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -375,6 +362,5 @@ mod tests {
         assert_eq!(config.backend, defaults.backend);
         assert_eq!(config.keep_days, defaults.keep_days);
         assert_eq!(config.keep_phrases, defaults.keep_phrases);
-        assert_eq!(config.tts, defaults.tts);
     }
 }

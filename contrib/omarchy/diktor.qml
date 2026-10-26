@@ -52,12 +52,9 @@ Item {
   property bool panelRequested: false
   readonly property bool panelOpen: panelRequested && onFocusedMonitor
   property var models: []
-  property var voices: []
   property var glossary: []
   property var misses: []
   property var phrases: []
-  property string ttsVoice: ""
-  property real ttsSpeed: 0.95
   property string downloadFile: ""
   property string downloadText: ""
   property string panelError: ""
@@ -94,7 +91,6 @@ Item {
 
   function loadPanel() {
     modelsProc.running = true
-    voicesProc.running = true
     glossaryProc.running = true
     missesProc.running = true
     loadPhrases()
@@ -179,11 +175,6 @@ Item {
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.models = root.parse(text, []) }
   }
   Process {
-    id: voicesProc
-    command: [root.diktor, "say", "--list-voices", "--json"]
-    stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.voices = root.parse(text, []) }
-  }
-  Process {
     id: glossaryProc
     command: [root.diktor, "glossary", "list", "--json"]
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.glossary = root.parse(text, []) }
@@ -196,19 +187,6 @@ Item {
   Process {
     id: phrasesProc
     stdout: StdioCollector { waitForEnd: true; onStreamFinished: root.phrases = root.parse(text, []) }
-  }
-  Process {
-    id: ttsProc
-    command: [root.diktor, "tts", "set", "--json"]
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var reply = root.parse(text, {})
-        if (reply.voice) root.ttsVoice = reply.voice
-        if (reply.speed) root.ttsSpeed = reply.speed
-      }
-    }
-    Component.onCompleted: running = true
   }
   // A download reports one JSON line per update.
   Process {
@@ -332,7 +310,7 @@ Item {
     }
   }
 
-  // The Diktor panel: model, voice, glossary, journal. Click mode: it takes
+  // The Diktor panel: model, glossary, journal. Click mode: it takes
   // input (text fields), a click outside closes it.
   PopupCard {
     id: panel
@@ -426,50 +404,6 @@ Item {
               downloadProc.command = [root.diktor, "model", "download", root.downloadFile, "--json"]
               downloadProc.running = true
             }
-          }
-        }
-
-        PanelSeparator { Layout.fillWidth: true }
-
-        // ---- Voice (diktor say)
-        PanelSectionHeader { text: "Голос" }
-
-        Dropdown {
-          Layout.fillWidth: true
-          label: "Голос"
-          options: root.voices.map(function(v) { return { value: v.id, label: v.id + " · " + v.language } })
-          value: root.ttsVoice
-          onChanged: function(value) {
-            root.ttsVoice = value
-            root.call(["tts", "set", "--voice", value, "--json"], false)
-          }
-        }
-
-        RowLayout {
-          Layout.fillWidth: true
-          spacing: Style.space(6)
-          Text {
-            text: "Скорость " + root.ttsSpeed.toFixed(2)
-            color: Color.popups.text
-            font.family: Style.font.family
-            font.pixelSize: Style.font.body
-          }
-          PanelSlider {
-            Layout.fillWidth: true
-            bar: root.bar
-            minimum: 0.5
-            maximum: 1.5
-            step: 0.05
-            value: root.ttsSpeed
-            onReleased: function(value) {
-              root.ttsSpeed = value
-              root.call(["tts", "set", "--speed", value.toFixed(2), "--json"], false)
-            }
-          }
-          Button {
-            text: "Прослушать"
-            bordered: true
-            onClicked: root.call(["say", "--preview", "--voice", root.ttsVoice], false)
           }
         }
 

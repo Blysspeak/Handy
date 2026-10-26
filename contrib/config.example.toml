@@ -44,12 +44,3 @@ fuzzy_terms = true
 # applies them at once, "suggest" keeps them pending until
 # `diktor glossary approve <spoken>`.
 claude_glossary = "auto"
-
-# `diktor say`: text to speech (English lessons). While diktor speaks, voice
-# mode hears silence, so its own voice is never typed.
-[tts]
-engine = "kokoro"
-voice = "bm_fable"
-speed = 0.95
-kokoro_helper = "~/.local/bin/say-en"
-kokoro_home = "~/.local/share/kokoro"
