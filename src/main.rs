@@ -11,7 +11,6 @@ mod glossary;
 mod ipc;
 mod journal;
 mod models;
-mod tts;
 mod vocabulary;
 mod voice_session;
 
@@ -91,38 +90,10 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Speak English text (Kokoro); voice mode ignores the microphone meanwhile.
-    Say {
-        /// Text; read from stdin when empty.
-        text: Vec<String>,
-        #[arg(long)]
-        voice: Option<String>,
-        #[arg(long)]
-        speed: Option<f32>,
-        /// Practice speed (0.75).
-        #[arg(long)]
-        slow: bool,
-        /// Write the WAV here instead of playing it.
-        #[arg(long, value_name = "FILE")]
-        out: Option<PathBuf>,
-        /// List the engine's voices.
-        #[arg(long)]
-        list_voices: bool,
-        /// Speak a sample sentence made of 2-3 of the owner's terms.
-        #[arg(long, conflicts_with = "text")]
-        preview: bool,
-        #[arg(long)]
-        json: bool,
-    },
     /// Recognition models: installed, catalog, download, switch.
     Model {
         #[command(subcommand)]
         action: ModelAction,
-    },
-    /// Speech output settings.
-    Tts {
-        #[command(subcommand)]
-        action: TtsAction,
     },
     /// Open, close or toggle the Diktor panel of the bar widget.
     Panel {
@@ -158,19 +129,6 @@ enum ModelAction {
     },
 }
 
-#[derive(Subcommand)]
-enum TtsAction {
-    /// Default voice and speed of `diktor say` (saved in [tts]).
-    Set {
-        #[arg(long)]
-        voice: Option<String>,
-        #[arg(long)]
-        speed: Option<f32>,
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if !matches!(cli.command, Command::Daemon { .. }) {
@@ -200,26 +158,7 @@ fn main() -> ExitCode {
         Command::Vocab { action } => cli_terms::vocab_command(action),
         Command::Misses { days, json } => cli_terms::misses_command(days, json),
         Command::Rewrite { text, json } => cli_terms::rewrite_command(&text, json),
-        Command::Say {
-            text,
-            voice,
-            speed,
-            slow,
-            out,
-            list_voices,
-            preview,
-            json,
-        } => say(SayArgs {
-            text,
-            preview,
-            voice,
-            speed: if slow { Some(tts::SLOW_SPEED) } else { speed },
-            out,
-            list_voices,
-            json,
-        }),
         Command::Model { action } => model_command(action),
-        Command::Tts { action } => tts_command(action),
         Command::Panel { action } => panel(&action),
         Command::Devices => devices(),
     };
@@ -348,26 +287,12 @@ fn daemon(config_path: PathBuf, input_wav: Option<PathBuf>) -> anyhow::Result<Ex
                     server_manager.stop();
                     json!({ "ok": true, "voice": voice(&server_manager) })
                 }
-                // `diktor say` is about to play / has played.
-                mute if mute.starts_with("mute ") => {
-                    let cap = mute
-                        .trim_start_matches("mute ")
-                        .trim()
-                        .parse()
-                        .unwrap_or(0_u64);
-                    route.mute(std::time::Duration::from_millis(cap.min(120_000)));
-                    json!({ "ok": true })
-                }
                 model if model.starts_with("model ") => {
                     let path = PathBuf::from(model.trim_start_matches("model ").trim());
                     match transcriber.reload(path) {
                         Ok(()) => json!({ "ok": true }),
                         Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
                     }
-                }
-                "unmute" => {
-                    route.unmute();
-                    json!({ "ok": true })
                 }
                 "status" => json!({
                     "ok": true,
@@ -524,82 +449,6 @@ fn lang(code: &str) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-struct SayArgs {
-    text: Vec<String>,
-    preview: bool,
-    voice: Option<String>,
-    speed: Option<f32>,
-    out: Option<PathBuf>,
-    list_voices: bool,
-    json: bool,
-}
-
-fn say(args: SayArgs) -> anyhow::Result<ExitCode> {
-    let config = Config::load(&config::config_path())?;
-    let engine = tts::engine(&config.tts)?;
-    if args.list_voices {
-        let voices = engine.voices()?;
-        if args.json {
-            println!("{}", serde_json::to_string(&voices)?);
-        } else {
-            for voice in voices {
-                let current = if voice.id == config.tts.voice {
-                    "  (config)"
-                } else {
-                    ""
-                };
-                println!("{} {}{current}", voice.id, voice.language);
-            }
-        }
-        return Ok(ExitCode::SUCCESS);
-    }
-    let mut text = args.text.join(" ");
-    if args.preview {
-        let journal = Journal::open(&config::data_dir(), config.keep_days, config.keep_phrases)?;
-        let dirs: Vec<_> = config
-            .vocabulary_dirs
-            .iter()
-            .map(|d| vocabulary::expand(d))
-            .collect();
-        let terms = vocabulary::effective(&journal, &dirs, &config.vocabulary_skip)?;
-        text = tts::preview_sentence(&terms, journal::now_ms().unsigned_abs());
-        eprintln!("{text}");
-    }
-    if text.trim().is_empty() {
-        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)?;
-    }
-    let text = text.trim().to_string();
-    anyhow::ensure!(!text.is_empty(), "нет текста");
-    let voice = args.voice.unwrap_or_else(|| config.tts.voice.clone());
-    let speed = args.speed.unwrap_or(config.tts.speed);
-    anyhow::ensure!(
-        (0.25..=4.0).contains(&speed),
-        "speed {speed}: ожидается 0.25..4"
-    );
-    if let Some(out) = &args.out {
-        engine.render(&text, &voice, speed, out)?;
-        println!("{}", out.display());
-        return Ok(ExitCode::SUCCESS);
-    }
-    let file = config::runtime_dir()?.join(format!("say-{}.wav", std::process::id()));
-    if let Some(directory) = file.parent() {
-        std::fs::create_dir_all(directory)?;
-    }
-    engine.render(&text, &voice, speed, &file)?;
-    let length = tts::duration(&file)?;
-    // Echo guard: the daemon (if any) hears silence until the tail has passed.
-    let socket = socket()?;
-    let cap = length + std::time::Duration::from_secs(3);
-    let _ = ipc::request(&socket, &format!("mute {}", cap.as_millis()));
-    let played = tts::play(&file);
-    let _ = ipc::request(&socket, "unmute");
-    let _ = std::fs::remove_file(&file);
-    played?;
-    let journal = Journal::open(&config::data_dir(), config.keep_days, config.keep_phrases)?;
-    journal.tts_spoken(&text, engine.name(), &voice, speed)?;
-    Ok(ExitCode::SUCCESS)
-}
-
 fn copy_id(id: i64) -> anyhow::Result<ExitCode> {
     let (journal, socket) = open_journal()?;
     let text = journal
@@ -695,47 +544,6 @@ fn model_command(action: ModelAction) -> anyhow::Result<ExitCode> {
                 );
             }
         }
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-fn tts_command(action: TtsAction) -> anyhow::Result<ExitCode> {
-    let TtsAction::Set { voice, speed, json } = action;
-    let path = config::config_path();
-    let config = Config::load(&path)?;
-    if let Some(voice) = &voice {
-        let engine = tts::engine(&config.tts)?;
-        anyhow::ensure!(
-            engine.voices()?.iter().any(|v| &v.id == voice),
-            "{voice}: нет такого голоса (diktor say --list-voices)"
-        );
-        config::save_value(
-            &path,
-            Some("tts"),
-            "voice",
-            toml::Value::String(voice.clone()),
-        )?;
-    }
-    if let Some(speed) = speed {
-        anyhow::ensure!(
-            (0.25..=4.0).contains(&speed),
-            "speed {speed}: ожидается 0.25..4"
-        );
-        config::save_value(
-            &path,
-            Some("tts"),
-            "speed",
-            toml::Value::Float((f64::from(speed) * 100.0).round() / 100.0),
-        )?;
-    }
-    let config = Config::load(&path)?;
-    if json {
-        println!(
-            "{}",
-            json!({ "ok": true, "voice": config.tts.voice, "speed": (f64::from(config.tts.speed) * 100.0).round() / 100.0 })
-        );
-    } else {
-        println!("голос {}, скорость {}", config.tts.voice, config.tts.speed);
     }
     Ok(ExitCode::SUCCESS)
 }
